@@ -30,15 +30,70 @@
 
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer, WebSocket } = require('ws');
 
+// ---- Logging helpers -------------------------------------------------------
+// Every line gets an ISO timestamp with milliseconds (Render's own column is
+// only second-resolution). Tokens are never logged in full: a room is shown
+// as "<first 6 chars>#<4 hex of sha1>", so two rooms that share a prefix
+// (diag7-a / diag7-b) still look different in the logs.
+const log = (...args) => console.log(new Date().toISOString(), '[relay]', ...args);
+const roomLabel = (token) =>
+  `${String(token).slice(0, 6)}#${crypto.createHash('sha1').update(String(token)).digest('hex').slice(0, 4)}`;
+const clientIp = (req) =>
+  String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?').split(',')[0].trim();
+const short = (v, n = 90) => (v == null ? '-' : String(v).slice(0, n));
+// "/viewer/abcdef123456" -> "/viewer/abcdef#1a2b" (never log a full token)
+const maskPath = (rawUrl) => {
+  try {
+    const parts = new URL(rawUrl, 'http://relay.local').pathname.split('/').filter(Boolean);
+    return parts.length >= 2 ? `/${parts[0]}/${roomLabel(parts[1])}` : `/${parts.join('/')}`;
+  } catch { return '(unparseable url)'; }
+};
+
 const app = express();
+
+// Plain HTTP request log (skips /health so Render's health checks don't spam).
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  const t0 = Date.now();
+  res.on('finish', () => {
+    log(`http ${req.method} ${maskPath(req.originalUrl)} -> ${res.statusCode} ${Date.now() - t0}ms ip=${clientIp(req)} ua="${short(req.headers['user-agent'])}"`);
+  });
+  next();
+});
+
+// Echoes what the server actually sees for the caller's own request. Open it
+// from the browser: if it loads, plain HTTPS from that browser reaches the
+// relay; the JSON shows the IP / Origin / User-Agent the relay receives.
+app.get('/whoami', (req, res) => {
+  const { cookie, authorization, ...headers } = req.headers;
+  res.json({ time: new Date().toISOString(), uptimeSeconds: Math.round(process.uptime()), ip: clientIp(req), headers });
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (_req, res) => res.status(200).send('SIONYX VNC Relay is up'));
 app.get('/health', (_req, res) => res.send('ok'));
 
 const server = http.createServer(app);
+
+// Logged BEFORE the ws library handles the handshake. If a browser attempt
+// never produces one of these lines, the request did not reach this server
+// at all (blocked upstream: NetFree, proxy, extension...). `ws` registers its
+// own 'upgrade' listener; this one is an additional read-only observer.
+server.on('upgrade', (req) => {
+  log(`upgrade ${maskPath(req.url)} ip=${clientIp(req)} origin=${short(req.headers.origin)} ua="${short(req.headers['user-agent'])}" ver=${short(req.headers['sec-websocket-version'])} up=${Math.round(process.uptime())}s`);
+});
+
+// Malformed HTTP on a connection. Adding this listener replaces Node's
+// default handler, so replicate it: answer 400 and close.
+server.on('clientError', (err, socket) => {
+  log(`clientError ${err.code || ''} ${err.message}`);
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  else socket.destroy();
+});
 // perMessageDeflate is ON by default in `ws`. VNC's Tight encoding is
 // already compressed, so re-compressing every frame with zlib here just
 // burns CPU for no size benefit - on Render's free tier (a sliver of a
@@ -117,7 +172,7 @@ function flushPending(room, role, ws) {
   for (const { data, isBinary } of queue) {
     ws.send(data, { binary: isBinary });
   }
-  console.log(`[relay] flushed ${queue.length} buffered message(s) to newly-joined ${role}`);
+  log(`flushed ${queue.length} buffered message(s) to newly-joined ${role}`);
   queue.length = 0;
 }
 
@@ -151,6 +206,7 @@ function startHeartbeat(ws) {
       return;
     }
     if (!ws.isAlive) {
+      log(`heartbeat timeout, terminating ${ws.logName || 'connection'} (no pong for ${HEARTBEAT_INTERVAL_MS}ms)`);
       ws.terminate();
       clearInterval(interval);
       return;
@@ -166,6 +222,7 @@ wss.on('connection', (ws, req) => {
   try {
     url = new URL(req.url, 'http://relay.local');
   } catch {
+    log(`closing: unparseable url ${short(req.url)}`);
     ws.close(1008, 'bad request');
     return;
   }
@@ -177,9 +234,17 @@ wss.on('connection', (ws, req) => {
   const token = parts[1];
 
   if (!ROLE_PAIRS[role] || !token || token.length < 8) {
+    log(`rejecting bad path ${maskPath(req.url)} (role=${role} tokenLength=${token ? token.length : 0}, need role in [${ROLES.join('|')}] and token >= 8 chars)`);
     ws.close(1008, 'expected /agent|viewer|controlAgent|controlViewer/<token>');
     return;
   }
+
+  const label = roomLabel(token);
+  ws.logName = `${role}@${label}`;
+  ws.joinedAt = Date.now();
+  ws.msgsIn = 0;
+  ws.bytesIn = 0;
+  ws.pauses = 0;
 
   const peerRole = ROLE_PAIRS[role];
   const room = getRoom(token);
@@ -197,16 +262,17 @@ wss.on('connection', (ws, req) => {
     const isStale = existing.readyState !== WebSocket.OPEN
       || (Date.now() - (existing.lastActivity || 0)) > STALE_CONNECTION_MS;
     if (!isStale) {
-      console.log(`[relay] rejecting duplicate ${role} connection for room ${token.slice(0, 6)}... - existing connection still active`);
+      log(`rejecting duplicate ${role} connection for room ${label} - existing connection still active (idle ${Date.now() - (existing.lastActivity || 0)}ms < ${STALE_CONNECTION_MS}ms)`);
       ws.close(4009, 'role already active');
       return;
     }
+    log(`replacing stale ${role} connection in room ${label} (readyState=${existing.readyState}, idle ${Date.now() - (existing.lastActivity || 0)}ms)`);
     try { existing.close(); } catch { /* ignore */ }
   }
   room[role] = ws;
   startHeartbeat(ws);
 
-  console.log(`[relay] ${role} joined room ${token.slice(0, 6)}... (${ROLES.map((r) => `${r}=${!!room[r]}`).join(' ')})`);
+  log(`${role} joined room ${label} (${ROLES.map((r) => `${r}=${!!room[r]}`).join(' ')}) origin=${short(req.headers.origin)} ip=${clientIp(req)}`);
 
   // Send anything that arrived for this role before it joined (e.g. the
   // agent's initial VNC handshake bytes sent before the viewer loaded).
@@ -217,6 +283,9 @@ wss.on('connection', (ws, req) => {
   // reconnect on either side keeps working.
   ws.on('message', (data, isBinary) => {
     ws.lastActivity = Date.now();
+    ws.msgsIn += 1;
+    ws.bytesIn += data.length;
+    if (ws.msgsIn === 1) log(`${ws.logName} first message: ${data.length} bytes ${isBinary ? 'binary' : 'text'} (${Date.now() - ws.joinedAt}ms after joining)`);
     const r = rooms.get(token);
     const peer = r?.[peerRole];
     if (peer && peer.readyState === WebSocket.OPEN) {
@@ -234,6 +303,8 @@ wss.on('connection', (ws, req) => {
       // the peer's outgoing buffer has drained, pushing the slowdown back
       // to whichever side is actually behind instead of piling it up here.
       if (peer.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES) {
+        ws.pauses += 1;
+        if (ws.pauses === 1 || ws.pauses % 100 === 0) log(`backpressure: pausing ${ws.logName} (peer ${peerRole} buffered ${peer.bufferedAmount} bytes, pause #${ws.pauses})`);
         ws.pause();
         const resumeWhenDrained = () => {
           if (peer.readyState !== WebSocket.OPEN || peer.bufferedAmount <= BACKPRESSURE_THRESHOLD_BYTES) {
@@ -246,19 +317,31 @@ wss.on('connection', (ws, req) => {
       }
     } else if (r) {
       // Peer hasn't joined yet (or reconnecting) - buffer instead of dropping.
+      if (r.pending[peerRole].length === 0) log(`${ws.logName}: peer ${peerRole} not connected, buffering messages for it`);
       bufferForPeer(r, peerRole, data, isBinary);
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reasonBuf) => {
+    log(`${ws.logName} closed code=${code} reason="${short(reasonBuf && reasonBuf.toString())}" lived=${Date.now() - ws.joinedAt}ms msgsIn=${ws.msgsIn} bytesIn=${ws.bytesIn} pauses=${ws.pauses}`);
     const r = rooms.get(token);
     if (!r) return;
     if (r[role] === ws) r[role] = null;
     cleanupIfEmpty(token, r);
   });
 
-  ws.on('error', () => { /* 'close' fires right after - cleanup happens there */ });
+  ws.on('error', (err) => {
+    // 'close' fires right after - cleanup happens there.
+    log(`${ws.logName} socket error: ${err.code || ''} ${err.message}`);
+  });
 });
 
+wss.on('error', (err) => log(`wss error: ${err.message}`));
+
+// Restarts / crashes are the other thing worth ruling out on Render's free tier.
+process.on('SIGTERM', () => { log(`SIGTERM received (Render is stopping/redeploying this instance), uptime=${Math.round(process.uptime())}s rooms=${rooms.size}`); process.exit(0); });
+process.on('uncaughtException', (err) => { log(`uncaughtException: ${err.stack || err}`); process.exit(1); });
+process.on('unhandledRejection', (err) => log(`unhandledRejection: ${err && err.stack || err}`));
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`[relay] listening on ${PORT}`));
+server.listen(PORT, () => log(`listening on ${PORT} (node ${process.version}, pid ${process.pid})`));
