@@ -131,9 +131,20 @@ function flushPending(room, role, ws) {
 // the noVNC viewer or the kiosk's VncRelayService.
 const HEARTBEAT_INTERVAL_MS = 15000;
 
+// How long a connection can go without any traffic (message or pong)
+// before a NEW connection for the same role is allowed to evict it. Below
+// this threshold the existing connection is assumed to still be genuinely
+// in use, so a second connect attempt for the same role is treated as a
+// spurious duplicate (e.g. a client-side retry/fallback race - see
+// VncRelayService's manual-handshake fallback, which can end up racing
+// against a still-pending primary attempt) rather than a real reconnect,
+// and is rejected instead of killing the working session.
+const STALE_CONNECTION_MS = 10000;
+
 function startHeartbeat(ws) {
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.lastActivity = Date.now();
+  ws.on('pong', () => { ws.isAlive = true; ws.lastActivity = Date.now(); });
   const interval = setInterval(() => {
     if (ws.readyState !== WebSocket.OPEN) {
       clearInterval(interval);
@@ -173,10 +184,24 @@ wss.on('connection', (ws, req) => {
   const peerRole = ROLE_PAIRS[role];
   const room = getRoom(token);
 
-  // A new connection for a role replaces any stale one (e.g. a page reload
-  // or the kiosk's WS reconnecting after a network blip).
-  if (room[role]) {
-    try { room[role].close(); } catch { /* ignore */ }
+  // A new connection for a role replaces a STALE one (e.g. a page reload,
+  // or the kiosk's WS reconnecting after a real network blip). But if the
+  // existing connection for this role has had real traffic recently, it's
+  // still genuinely in use - unconditionally closing it here was causing
+  // working sessions to drop the moment a second, spurious connection
+  // attempt showed up for the same role (e.g. a client-side retry racing
+  // a still-pending primary attempt). In that case reject the newcomer
+  // instead and let the existing session keep running.
+  const existing = room[role];
+  if (existing) {
+    const isStale = existing.readyState !== WebSocket.OPEN
+      || (Date.now() - (existing.lastActivity || 0)) > STALE_CONNECTION_MS;
+    if (!isStale) {
+      console.log(`[relay] rejecting duplicate ${role} connection for room ${token.slice(0, 6)}... - existing connection still active`);
+      ws.close(4009, 'role already active');
+      return;
+    }
+    try { existing.close(); } catch { /* ignore */ }
   }
   room[role] = ws;
   startHeartbeat(ws);
@@ -191,6 +216,7 @@ wss.on('connection', (ws, req) => {
   // so it doesn't matter which side joins first, and a mid-session
   // reconnect on either side keeps working.
   ws.on('message', (data, isBinary) => {
+    ws.lastActivity = Date.now();
     const r = rooms.get(token);
     const peer = r?.[peerRole];
     if (peer && peer.readyState === WebSocket.OPEN) {
