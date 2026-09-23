@@ -61,6 +61,9 @@
   // Vendored copy of noVNC's core/rfb.js (from @novnc/novnc@1.7.0),
   // served directly by this same relay - no third-party CDN dependency.
   import RFB from './novnc/core/rfb.js';
+  // WebSocket first, automatic fallback to plain HTTPS long-polling when a
+  // filter (NetFree) blocks or swallows the WebSocket - see relay-transport.js.
+  import { connectRelayChannel } from './relay-transport.js';
 
   const statusEl = document.getElementById('status');
   const clipNoticeEl = document.getElementById('clipNotice');
@@ -71,10 +74,19 @@
   if (!token) {
     statusEl.textContent = 'חסר token בכתובת (?token=...)';
   } else {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${proto}://${location.host}/viewer/${encodeURIComponent(token)}`;
+    // ?transport=http (or ws) forces one transport - useful for testing.
+    const forced = params.get('transport') || 'auto';
 
-    const rfb = new RFB(document.getElementById('screen'), wsUrl, {
+    let channel;
+    try {
+      channel = await connectRelayChannel('viewer', token, { transport: forced });
+    } catch (e) {
+      statusEl.textContent = 'לא הצלחתי להתחבר לרלי: ' + e.message;
+      throw e;
+    }
+    const transportLabel = channel.transport === 'http' ? ' (HTTP - איטי יותר)' : '';
+
+    const rfb = new RFB(document.getElementById('screen'), channel, {
       credentials: { password },
     });
     rfb.scaleViewport = true;
@@ -116,16 +128,29 @@
     // normal click is suppressed for that one interaction only. This is a
     // brand-new, field-untested feature - confirm it actually works on one
     // kiosk before relying on it.
-    const controlWsUrl = `${proto}://${location.host}/controlViewer/${encodeURIComponent(token)}`;
-    let controlWs = null;
-    let controlWsReady = false;
+    // The control channel uses the same transport selection as the main
+    // one (WebSocket if it works, HTTP otherwise). sendControl() connects on
+    // first use and resolves true if the message was handed to the channel.
+    let controlChannelPromise = null;
+    let controlReady = false;
     function ensureControlWs() {
-      if (controlWs && (controlWs.readyState === WebSocket.OPEN || controlWs.readyState === WebSocket.CONNECTING)) return;
-      controlWs = new WebSocket(controlWsUrl);
-      controlWsReady = false;
-      controlWs.addEventListener('open', () => { controlWsReady = true; });
-      controlWs.addEventListener('close', () => { controlWsReady = false; });
-      controlWs.addEventListener('error', () => { controlWsReady = false; });
+      if (controlChannelPromise) return controlChannelPromise;
+      controlChannelPromise = connectRelayChannel('controlViewer', token, { transport: forced })
+        .then((ch) => {
+          controlReady = true;
+          const reset = () => { controlReady = false; controlChannelPromise = null; };
+          ch.onclose = reset;
+          ch.onerror = reset;
+          return ch;
+        })
+        .catch(() => { controlReady = false; controlChannelPromise = null; return null; });
+      return controlChannelPromise;
+    }
+    async function sendControl(obj) {
+      const ch = await ensureControlWs();
+      if (!ch || ch.readyState !== 1) return false;
+      ch.send(JSON.stringify(obj));
+      return true;
     }
 
     const btnElevated = document.getElementById('btnElevatedClick');
@@ -133,7 +158,7 @@
     function setElevatedArmed(on) {
       elevatedArmed = on;
       btnElevated.classList.toggle('active', on);
-      statusEl.textContent = on ? 'לחיצה מוגברת: לחץ פעם אחת על המקום הרצוי במסך' : 'מחובר';
+      statusEl.textContent = on ? 'לחיצה מוגברת: לחץ פעם אחת על המקום הרצוי במסך' : 'מחובר' + transportLabel;
     }
     btnElevated.addEventListener('click', () => {
       if (elevatedArmed) { setElevatedArmed(false); return; }
@@ -153,14 +178,11 @@
       const xFrac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
       const yFrac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
       setElevatedArmed(false);
-      if (controlWsReady) {
-        controlWs.send(JSON.stringify({ type: 'click', xFrac, yFrac }));
-        clipNoticeEl.textContent = 'קליק מוגבר נשלח';
-      } else {
-        clipNoticeEl.textContent = 'ערוץ הקליק המוגבר לא מחובר - נסה שוב';
-      }
-      clipNoticeEl.style.display = 'block';
-      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      sendControl({ type: 'click', xFrac, yFrac }).then((sent) => {
+        clipNoticeEl.textContent = sent ? 'קליק מוגבר נשלח' : 'ערוץ הקליק המוגבר לא מחובר - נסה שוב';
+        clipNoticeEl.style.display = 'block';
+        setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      });
     }, true);
 
     // Ctrl+Alt+Del - a real Secure Attention Sequence via the kiosk's
@@ -169,12 +191,11 @@
     // with the operator first since it can interrupt whatever's on screen.
     document.getElementById('btnCtrlAltDel').addEventListener('click', () => {
       if (!confirm('לשלוח Ctrl+Alt+Del לקיוסק?')) return;
-      ensureControlWs();
-      const send = () => controlWs.send(JSON.stringify({ type: 'ctrlaltdel' }));
-      if (controlWsReady) send(); else controlWs.addEventListener('open', send, { once: true });
-      clipNoticeEl.textContent = 'Ctrl+Alt+Del נשלח';
-      clipNoticeEl.style.display = 'block';
-      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      sendControl({ type: 'ctrlaltdel' }).then((sent) => {
+        clipNoticeEl.textContent = sent ? 'Ctrl+Alt+Del נשלח' : 'ערוץ הבקרה לא מחובר - נסה שוב';
+        clipNoticeEl.style.display = 'block';
+        setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      });
     });
 
     // Types text (e.g. a password) directly on the kiosk via the same
@@ -185,16 +206,15 @@
       const input = document.getElementById('typeTextInput');
       const text = input.value;
       if (!text) return;
-      ensureControlWs();
-      const send = () => controlWs.send(JSON.stringify({ type: 'typeText', text }));
-      if (controlWsReady) send(); else controlWs.addEventListener('open', send, { once: true });
       input.value = '';
-      clipNoticeEl.textContent = 'הטקסט נשלח והוקש';
-      clipNoticeEl.style.display = 'block';
-      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      sendControl({ type: 'typeText', text }).then((sent) => {
+        clipNoticeEl.textContent = sent ? 'הטקסט נשלח והוקש' : 'ערוץ הבקרה לא מחובר - נסה שוב';
+        clipNoticeEl.style.display = 'block';
+        setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+      });
     });
 
-    rfb.addEventListener('connect', () => { statusEl.textContent = 'מחובר'; });
+    rfb.addEventListener('connect', () => { statusEl.textContent = 'מחובר' + transportLabel; });
     rfb.addEventListener('disconnect', (e) => {
       const clean = e?.detail?.clean;
       statusEl.textContent = clean ? 'החיבור נסגר' : 'החיבור נפל - ודא שהקיוסק פתח סשן חדש (token אחד-פעמי)';
