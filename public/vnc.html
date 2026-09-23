@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<title>SIONYX - שליטה מרחוק</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: sans-serif; }
+  #status { position: fixed; top: 8px; left: 8px; color: #ddd; font-size: 14px;
+            background: rgba(0,0,0,.5); padding: 4px 10px; border-radius: 6px; z-index: 10; }
+  #screen { position: absolute; top: 0; left: 0; right: 0; bottom: 40px; }
+  #toolbar {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 40px;
+    background: #1c1c1c; display: flex; align-items: center; gap: 6px;
+    padding: 0 8px; box-sizing: border-box; z-index: 10; direction: ltr;
+  }
+  #toolbar button {
+    background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;
+    padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  #toolbar button:hover { background: #444; }
+  #toolbar button.active { background: #2f6fed; border-color: #2f6fed; }
+  #toolbar select { background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 4px; font-size: 13px; }
+  #toolbar .sep { width: 1px; height: 22px; background: #444; margin: 0 4px; }
+  #pasteBox { width: 160px; font-size: 13px; padding: 4px; border-radius: 4px; border: 1px solid #555; background: #222; color: #eee; }
+  #clipNotice {
+    position: fixed; bottom: 48px; left: 8px; color: #ddd; font-size: 12px;
+    background: rgba(0,0,0,.6); padding: 4px 8px; border-radius: 6px; z-index: 10;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="status">מתחבר...</div>
+<div id="screen"></div>
+<div id="clipNotice"></div>
+
+<div id="toolbar">
+  <button id="btnAltTab" title="Alt+Tab">Alt+Tab</button>
+  <button id="btnWin" title="מקש Windows">Win</button>
+  <div class="sep"></div>
+  <input id="pasteBox" placeholder="הדבק כאן ← שלח למחשב" />
+  <button id="btnSendPaste" title="שלח את הטקסט הזה כהקלדה למחשב המרוחק">שלח</button>
+  <button id="btnCopyRemote" title="העתק את מה שהועתק במחשב המרוחק" disabled>העתק ממחשב מרוחק</button>
+  <div class="sep"></div>
+  <span style="color:#aaa; font-size:12px;">מהירות:</span>
+  <select id="qualitySel" title="איכות/מהירות התמונה">
+    <option value="fast">מהיר (איכות נמוכה)</option>
+    <option value="balanced" selected>מאוזן</option>
+    <option value="quality">איכות גבוהה (איטי יותר)</option>
+  </select>
+  <div class="sep"></div>
+  <button id="btnElevatedClick" title="לחיצה אחת שמוזרקת ברמת הרשאה גבוהה (SYSTEM) - לדיאלוגים שלא מגיבים לקליק רגיל, כמו אישור AeroAdmin או UAC. לוחצים כאן, ואז לוחצים פעם אחת על המקום הרצוי במסך.">V מוגבר</button>
+  <button id="btnCtrlAltDel" title="שולח Ctrl+Alt+Del דרך SionyxInputInjector (SendSAS) - שירות SYSTEM בקיוסק. תלוי בשירות הזה להיות מותקן ורץ.">Ctrl+Alt+Del</button>
+  <input id="typeTextInput" type="password" placeholder="הקלד כאן..." title="הטקסט יוקלד ישירות בקיוסק (כולל Enter בסוף) - לא נשמר בשום מקום, נשלח פעם אחת." style="width:120px" />
+  <button id="btnTypeText" title="מקליד את הטקסט שלמעלה בקיוסק ולוחץ Enter.">הקלד</button>
+  <div class="sep"></div>
+  <button id="btnFullscreen" title="מסך מלא">מסך מלא</button>
+</div>
+
+<script type="module">
+  // Vendored copy of noVNC's core/rfb.js (from @novnc/novnc@1.7.0),
+  // served directly by this same relay - no third-party CDN dependency.
+  import RFB from './novnc/core/rfb.js';
+
+  const statusEl = document.getElementById('status');
+  const clipNoticeEl = document.getElementById('clipNotice');
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token');
+  const password = params.get('password') || '';
+
+  if (!token) {
+    statusEl.textContent = 'חסר token בכתובת (?token=...)';
+  } else {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${proto}://${location.host}/viewer/${encodeURIComponent(token)}`;
+
+    const rfb = new RFB(document.getElementById('screen'), wsUrl, {
+      credentials: { password },
+    });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+
+    // Speed/quality: noVNC's Tight encoder negotiates these with the
+    // server per-frame. Lower quality + higher compression trades visual
+    // fidelity for speed - useful on the free relay tier where the extra
+    // network hop (browser -> relay -> kiosk) adds latency we can't remove,
+    // but bytes-per-frame we can. "balanced" matches noVNC's own defaults.
+    const QUALITY_PRESETS = {
+      fast:     { quality: 3, compression: 8 },
+      balanced: { quality: 6, compression: 2 },
+      quality:  { quality: 9, compression: 1 },
+    };
+    function applyQuality(preset) {
+      const p = QUALITY_PRESETS[preset] || QUALITY_PRESETS.balanced;
+      rfb.qualityLevel = p.quality;
+      rfb.compressionLevel = p.compression;
+    }
+    applyQuality('balanced');
+    document.getElementById('qualitySel').addEventListener('change', (e) => {
+      applyQuality(e.target.value);
+    });
+
+    // "V מוגבר" (elevated click) - added 2026-09-14. Some dialogs (AeroAdmin's
+    // connection-approval popup, Windows UAC/Secure-Desktop prompts) don't
+    // react to TightVNC's normal SendInput-based clicks, because the
+    // injecting process (SionyxKiosk, running as the interactive user) is
+    // at a lower Windows integrity level than those dialogs. This sends the
+    // click through an entirely separate JSON side-channel to a new SYSTEM
+    // Windows service (SionyxInputInjector) on the kiosk instead, which can
+    // inject into anything. It never touches the normal RFB pointer path,
+    // so a bug here can't cause a double-click on the real VNC session -
+    // worst case this button just doesn't do anything.
+    //
+    // One-shot by design (not a persistent mode): arms on click, consumes
+    // itself on the very next click anywhere in the screen area, and the
+    // normal click is suppressed for that one interaction only. This is a
+    // brand-new, field-untested feature - confirm it actually works on one
+    // kiosk before relying on it.
+    const controlWsUrl = `${proto}://${location.host}/controlViewer/${encodeURIComponent(token)}`;
+    let controlWs = null;
+    let controlWsReady = false;
+    function ensureControlWs() {
+      if (controlWs && (controlWs.readyState === WebSocket.OPEN || controlWs.readyState === WebSocket.CONNECTING)) return;
+      controlWs = new WebSocket(controlWsUrl);
+      controlWsReady = false;
+      controlWs.addEventListener('open', () => { controlWsReady = true; });
+      controlWs.addEventListener('close', () => { controlWsReady = false; });
+      controlWs.addEventListener('error', () => { controlWsReady = false; });
+    }
+
+    const btnElevated = document.getElementById('btnElevatedClick');
+    let elevatedArmed = false;
+    function setElevatedArmed(on) {
+      elevatedArmed = on;
+      btnElevated.classList.toggle('active', on);
+      statusEl.textContent = on ? 'לחיצה מוגברת: לחץ פעם אחת על המקום הרצוי במסך' : 'מחובר';
+    }
+    btnElevated.addEventListener('click', () => {
+      if (elevatedArmed) { setElevatedArmed(false); return; }
+      ensureControlWs();
+      setElevatedArmed(true);
+    });
+
+    // Capture-phase listener on the screen container so an armed elevated
+    // click is consumed here and never reaches noVNC's own canvas handler
+    // underneath (which would otherwise also send a normal PointerEvent).
+    document.getElementById('screen').addEventListener('mousedown', (e) => {
+      if (!elevatedArmed) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const canvas = document.querySelector('#screen canvas');
+      const rect = (canvas || e.currentTarget).getBoundingClientRect();
+      const xFrac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const yFrac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+      setElevatedArmed(false);
+      if (controlWsReady) {
+        controlWs.send(JSON.stringify({ type: 'click', xFrac, yFrac }));
+        clipNoticeEl.textContent = 'קליק מוגבר נשלח';
+      } else {
+        clipNoticeEl.textContent = 'ערוץ הקליק המוגבר לא מחובר - נסה שוב';
+      }
+      clipNoticeEl.style.display = 'block';
+      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+    }, true);
+
+    // Ctrl+Alt+Del - a real Secure Attention Sequence via the kiosk's
+    // SionyxInputInjector service (SendSAS), not a simulated keystroke -
+    // simulated Ctrl+Alt+Del is impossible by Windows design. Confirmed
+    // with the operator first since it can interrupt whatever's on screen.
+    document.getElementById('btnCtrlAltDel').addEventListener('click', () => {
+      if (!confirm('לשלוח Ctrl+Alt+Del לקיוסק?')) return;
+      ensureControlWs();
+      const send = () => controlWs.send(JSON.stringify({ type: 'ctrlaltdel' }));
+      if (controlWsReady) send(); else controlWs.addEventListener('open', send, { once: true });
+      clipNoticeEl.textContent = 'Ctrl+Alt+Del נשלח';
+      clipNoticeEl.style.display = 'block';
+      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+    });
+
+    // Types text (e.g. a password) directly on the kiosk via the same
+    // SYSTEM-level path, then presses Enter. Sent once over the WebSocket
+    // and never written anywhere - the input field is type="password" so
+    // it isn't shown on screen either.
+    document.getElementById('btnTypeText').addEventListener('click', () => {
+      const input = document.getElementById('typeTextInput');
+      const text = input.value;
+      if (!text) return;
+      ensureControlWs();
+      const send = () => controlWs.send(JSON.stringify({ type: 'typeText', text }));
+      if (controlWsReady) send(); else controlWs.addEventListener('open', send, { once: true });
+      input.value = '';
+      clipNoticeEl.textContent = 'הטקסט נשלח והוקש';
+      clipNoticeEl.style.display = 'block';
+      setTimeout(() => clipNoticeEl.style.display = 'none', 2000);
+    });
+
+    rfb.addEventListener('connect', () => { statusEl.textContent = 'מחובר'; });
+    rfb.addEventListener('disconnect', (e) => {
+      const clean = e?.detail?.clean;
+      statusEl.textContent = clean ? 'החיבור נסגר' : 'החיבור נפל - ודא שהקיוסק פתח סשן חדש (token אחד-פעמי)';
+    });
+    rfb.addEventListener('credentialsrequired', () => {
+      statusEl.textContent = 'סיסמת VNC שגויה או חסרה (?password=...)';
+    });
+
+    // Remote -> local clipboard: TightVNC sends this whenever something is
+    // copied on the remote machine. Browsers don't allow silently writing
+    // to the OS clipboard outside a user gesture, so this arms a button
+    // instead of copying automatically.
+    let lastRemoteClipboard = '';
+    rfb.addEventListener('clipboard', (e) => {
+      lastRemoteClipboard = e.detail.text || '';
+      const btn = document.getElementById('btnCopyRemote');
+      btn.disabled = !lastRemoteClipboard;
+    });
+    document.getElementById('btnCopyRemote').addEventListener('click', async () => {
+      if (!lastRemoteClipboard) return;
+      try {
+        await navigator.clipboard.writeText(lastRemoteClipboard);
+        clipNoticeEl.textContent = 'הועתק ללוח שלך';
+      } catch {
+        clipNoticeEl.textContent = 'הדפדפן חסם העתקה אוטומטית - השתמש בהדבקה הרגילה בתוך המסך';
+      }
+      clipNoticeEl.style.display = 'block';
+      setTimeout(() => clipNoticeEl.style.display = 'none', 2500);
+    });
+
+    // Local -> remote clipboard: type/paste into the box, then send. This
+    // is a workaround, not real bidirectional clipboard sync, because a
+    // browser tab has no standing permission to read the OS clipboard on
+    // its own - it can only read what the user explicitly pastes into a
+    // page element.
+    document.getElementById('btnSendPaste').addEventListener('click', () => {
+      const box = document.getElementById('pasteBox');
+      if (!box.value) return;
+      rfb.clipboardPasteFrom(box.value);
+      box.value = '';
+    });
+
+    // Alt+Tab and Win: the OS intercepts these before a normal keystroke
+    // would ever reach the remote session too, but (unlike Ctrl+Alt+Del)
+    // Windows does deliver a simulated version of these through the VNC
+    // session just fine, so no SendSAS-style real injection is needed here.
+    document.getElementById('btnAltTab').addEventListener('click', () => {
+      rfb.sendKey(0xffe9, 'AltLeft', true);   // XK_Alt_L
+      rfb.sendKey(0xff09, 'Tab', true);       // XK_Tab
+      rfb.sendKey(0xff09, 'Tab', false);
+      rfb.sendKey(0xffe9, 'AltLeft', false);
+    });
+    document.getElementById('btnWin').addEventListener('click', () => {
+      rfb.sendKey(0xffeb, 'MetaLeft', true);  // XK_Super_L
+      rfb.sendKey(0xffeb, 'MetaLeft', false);
+    });
+
+    document.getElementById('btnFullscreen').addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen?.();
+      } else {
+        document.exitFullscreen?.();
+      }
+    });
+  }
+</script>
+</body>
+</html>

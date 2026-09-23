@@ -1,0 +1,17 @@
+{
+  "name": "sionyx-vnc-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket relay + noVNC viewer for remote-controlling SIONYX kiosks through NetFree TLS interception",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}
