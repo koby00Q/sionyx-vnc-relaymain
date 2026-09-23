@@ -85,6 +85,11 @@ const server = http.createServer(app);
 // own 'upgrade' listener; this one is an additional read-only observer.
 server.on('upgrade', (req) => {
   log(`upgrade ${maskPath(req.url)} ip=${clientIp(req)} origin=${short(req.headers.origin)} ua="${short(req.headers['user-agent'])}" ver=${short(req.headers['sec-websocket-version'])} up=${Math.round(process.uptime())}s`);
+  // Full request headers exactly as the relay received them (after any proxy /
+  // TLS-inspecting filter on the way). Comparing a browser attempt with a
+  // PowerShell attempt shows what differs. Secrets and the WebSocket key are dropped.
+  const { cookie, authorization, 'sec-websocket-key': _key, ...hdrs } = req.headers;
+  log(`upgrade headers ${maskPath(req.url)} http/${req.httpVersion}: ${JSON.stringify(hdrs)}`);
 });
 
 // Malformed HTTP on a connection. Adding this listener replaces Node's
@@ -171,6 +176,7 @@ function flushPending(room, role, ws) {
   if (!queue.length) return;
   for (const { data, isBinary } of queue) {
     ws.send(data, { binary: isBinary });
+    ws.msgsOut += 1;
   }
   log(`flushed ${queue.length} buffered message(s) to newly-joined ${role}`);
   queue.length = 0;
@@ -244,6 +250,7 @@ wss.on('connection', (ws, req) => {
   ws.joinedAt = Date.now();
   ws.msgsIn = 0;
   ws.bytesIn = 0;
+  ws.msgsOut = 0;
   ws.pauses = 0;
 
   const peerRole = ROLE_PAIRS[role];
@@ -290,6 +297,7 @@ wss.on('connection', (ws, req) => {
     const peer = r?.[peerRole];
     if (peer && peer.readyState === WebSocket.OPEN) {
       peer.send(data, { binary: isBinary });
+      peer.msgsOut = (peer.msgsOut || 0) + 1;
       // Backpressure: while the screen is static there's almost no traffic,
       // so this never triggers - which is why a fresh connection looks
       // fine. The moment real use starts (mouse move, typing, a window
@@ -323,7 +331,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', (code, reasonBuf) => {
-    log(`${ws.logName} closed code=${code} reason="${short(reasonBuf && reasonBuf.toString())}" lived=${Date.now() - ws.joinedAt}ms msgsIn=${ws.msgsIn} bytesIn=${ws.bytesIn} pauses=${ws.pauses}`);
+    log(`${ws.logName} closed code=${code} reason="${short(reasonBuf && reasonBuf.toString())}" lived=${Date.now() - ws.joinedAt}ms msgsIn=${ws.msgsIn} bytesIn=${ws.bytesIn} msgsOut=${ws.msgsOut} pauses=${ws.pauses}`);
     const r = rooms.get(token);
     if (!r) return;
     if (r[role] === ws) r[role] = null;
@@ -334,6 +342,14 @@ wss.on('connection', (ws, req) => {
     // 'close' fires right after - cleanup happens there.
     log(`${ws.logName} socket error: ${err.code || ''} ${err.message}`);
   });
+});
+
+// Fires only when the relay ACCEPTS a handshake, right before it writes the
+// "101 Switching Protocols" response. If this line appears for an attempt
+// but the client reports a different status (e.g. 418), something between
+// the relay and the client replaced the response.
+wss.on('headers', (headers, req) => {
+  log(`responding to ${maskPath(req.url)}: ${headers.filter((h) => !/^sec-websocket-accept/i.test(h)).join(' | ')}`);
 });
 
 wss.on('error', (err) => log(`wss error: ${err.message}`));
