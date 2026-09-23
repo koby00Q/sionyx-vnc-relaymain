@@ -50,6 +50,9 @@ const express = require('express');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const app = express();
+// Render sits behind Cloudflare + its own proxy. Without this, req.ip is the
+// proxy's address ("::1"), which made every client look identical in the logs.
+app.set('trust proxy', true);
 
 // ---------------------------------------------------------------------------
 // Logging helpers
@@ -85,10 +88,19 @@ process.on('unhandledRejection', (err) => console.error(`[relay] ${ts()} unhandl
 app.get('/whoami', (req, res) => {
   console.log(`[relay] ${ts()} /whoami from ip=${req.ip} xff=${req.headers['x-forwarded-for'] || '-'}`);
   res.json({
-    ip: req.ip,
+    time: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    ip: req.headers['cf-connecting-ip'] || req.ip,
     ips: req.ips,
     headers: req.headers,
   });
+});
+
+// The manual kiosk-side test script (public/agent-test.ps1), served as plain text
+// so the kiosk can fetch it with iwr/irm (express.static would label .ps1 as
+// application/octet-stream, which PowerShell hands back as bytes, not text).
+app.get('/agent-test.ps1', (_req, res) => {
+  res.type('text/plain; charset=utf-8').sendFile(path.join(__dirname, 'public', 'agent-test.ps1'));
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -185,6 +197,50 @@ const HTTP_ACTIVE_WINDOW_MS = 30000;
 const PROBE_MESSAGE = '__relay_probe__';
 const PROBE_ACK = '__relay_probe_ack__';
 
+
+// ---------------------------------------------------------------------------
+// Stream taps (diagnostics)
+// ---------------------------------------------------------------------------
+// A VNC session is ONE ordered byte stream per direction. If a single byte is
+// lost, duplicated or reordered anywhere on the way, noVNC fails with garbage
+// like "Unsupported encoding: 214103812". To find WHERE the stream breaks, each
+// hop keeps a running byte counter + CRC32 and logs it at fixed offsets
+// (every 64 KiB for the first MiB, then every MiB). The kiosk test script, this
+// server and the browser (vnc.html?debug=1) use the same offsets, so the first
+// offset where two hops print a different crc is where the stream was damaged.
+const TAP_FINE_LIMIT = 1024 * 1024;
+const TAP_FINE_STEP = 64 * 1024;
+const TAP_COARSE_STEP = 1024 * 1024;
+function tapNextCheckpoint(off) {
+  return off < TAP_FINE_LIMIT
+    ? (Math.floor(off / TAP_FINE_STEP) + 1) * TAP_FINE_STEP
+    : (Math.floor(off / TAP_COARSE_STEP) + 1) * TAP_COARSE_STEP;
+}
+const zlibCrc32 = require('zlib').crc32; // Node >= 20.15 / 22.2; taps are skipped on older Node
+class StreamTap {
+  constructor(label) { this.label = label; this.total = 0; this.crc = 0; }
+  feed(buf) {
+    if (!zlibCrc32) { this.total += buf.length; return; }
+    let pos = 0;
+    while (pos < buf.length) {
+      const next = tapNextCheckpoint(this.total);
+      const take = Math.min(buf.length - pos, next - this.total);
+      this.crc = zlibCrc32(buf.subarray(pos, pos + take), this.crc);
+      this.total += take; pos += take;
+      if (this.total === next) {
+        console.log(`[tap] ${ts()} ${this.label} @${this.total} crc=${(this.crc >>> 0).toString(16).padStart(8, '0')}`);
+      }
+    }
+  }
+}
+function tapOf(room, role, kind) {
+  const key = `${role}.${kind}`;
+  if (!room.taps[key]) room.taps[key] = new StreamTap(`${roomLabel(room.token)} ${key}`);
+  return room.taps[key];
+}
+const asBuf = (d) => (Buffer.isBuffer(d) ? d : Buffer.from(d));
+function isByteStreamRole(role) { return role === 'agent' || role === 'viewer'; }
+
 function httpActive(room, role) {
   const seen = room.httpSeen[role];
   return !!seen && (Date.now() - seen) < HTTP_ACTIVE_WINDOW_MS;
@@ -197,7 +253,7 @@ function wsUsable(ws) {
 
 function wakeWaiters(room, role) {
   const list = room.waiters[role];
-  if (!list.length) return;
+  if (!list || !list.length) return;
   room.waiters[role] = [];
   for (const fn of list) fn();
 }
@@ -208,17 +264,17 @@ function waitForWake(room, role, ms) {
     let timer;
     const done = () => { clearTimeout(timer); resolve(); };
     timer = setTimeout(() => {
-      room.waiters[role] = room.waiters[role].filter((f) => f !== done);
+      room.waiters[role] = (room.waiters[role] || []).filter((f) => f !== done);
       resolve();
     }, ms);
-    room.waiters[role].push(done);
+    (room.waiters[role] = room.waiters[role] || []).push(done);
   });
 }
 
 function getRoom(token) {
   let room = rooms.get(token);
   if (!room) {
-    room = { pending: {}, httpSeen: {}, peerClosed: {}, waiters: {} };
+    room = { token, taps: {}, pending: {}, httpSeen: {}, peerClosed: {}, waiters: {} };
     for (const role of ROLES) {
       room[role] = null; room.pending[role] = []; room.peerClosed[role] = false; room.waiters[role] = [];
     }
@@ -237,11 +293,34 @@ function pendingByteLength(queue) {
   return queue.reduce((sum, item) => sum + item.data.length, 0);
 }
 
+// VNC (agent/viewer) is a byte stream: dropping ANY queued chunk silently
+// shifts every later byte and noVNC dies with "Unsupported encoding". The old
+// code dropped the OLDEST chunks whenever a slow HTTP poller let more than
+// 200 messages / 5 MB pile up (an easy thing to hit: the very first full-screen
+// frame is several MB). Now a byte-stream queue is never trimmed. Instead:
+//   - /send makes the sender wait (backpressure) while the peer's queue is big,
+//   - and if the queue still grows past HARD_CAP the session is closed loudly
+//     (both sides see a disconnect) rather than delivering a corrupted stream.
+// Control channels (JSON messages, occasional) keep the old drop-oldest cap.
+const STREAM_HARD_CAP_BYTES = 64 * 1024 * 1024;
+const STREAM_HIGH_WATER_BYTES = 2 * 1024 * 1024; // /send stalls above this
+const STREAM_LOW_WATER_BYTES = 512 * 1024;       // ...until it drains below this
+
 function bufferForPeer(room, peerRole, data, isBinary) {
   const queue = room.pending[peerRole];
   queue.push({ data, isBinary });
-  while (queue.length > MAX_PENDING_MESSAGES || pendingByteLength(queue) > MAX_PENDING_BYTES) {
-    queue.shift();
+  if (isByteStreamRole(peerRole)) {
+    if (pendingByteLength(queue) > STREAM_HARD_CAP_BYTES) {
+      console.error(`[relay] ${ts()} OVERFLOW room ${roomLabel(room.token)}: ${peerRole} is not draining (>${STREAM_HARD_CAP_BYTES} bytes queued). Closing the session instead of dropping bytes.`);
+      queue.length = 0;
+      room.peerClosed[peerRole] = true;
+      const ws = room[peerRole];
+      if (ws) { try { ws.close(1011, 'relay overflow'); } catch { /* ignore */ } }
+    }
+  } else {
+    while (queue.length > MAX_PENDING_MESSAGES || pendingByteLength(queue) > MAX_PENDING_BYTES) {
+      queue.shift();
+    }
   }
   wakeWaiters(room, peerRole);
 }
@@ -251,6 +330,7 @@ function flushPending(room, role, ws) {
   if (!queue.length) return;
   for (const { data, isBinary } of queue) {
     ws.send(data, { binary: isBinary });
+    if (isByteStreamRole(role) && isBinary) tapOf(room, ROLE_PAIRS[role], 'out').feed(asBuf(data));
   }
   console.log(`[relay] ${ts()} flushed ${queue.length} buffered message(s) to newly-joined ${role}`);
   queue.length = 0;
@@ -263,11 +343,14 @@ function flushPending(room, role, ws) {
 function routeMessage(room, role, data, isBinary) {
   const peerRole = ROLE_PAIRS[role];
   const peer = room[peerRole];
+  const tapped = isByteStreamRole(role) && isBinary;
+  if (tapped) tapOf(room, role, 'in').feed(asBuf(data));
   // Prefer HTTP if the peer is currently talking to us over HTTP: a ghost
   // WebSocket (see PROBE_MESSAGE) may still be registered for that role, and
   // anything sent into it would vanish.
   if (wsUsable(peer) && !httpActive(room, peerRole)) {
     peer.send(data, { binary: isBinary });
+    if (tapped) tapOf(room, role, 'out').feed(asBuf(data));
     if (peer.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES) {
       return 'peer-backpressured'; // caller decides what to do (WS path pauses; HTTP path ignores - no socket to pause)
     }
@@ -489,7 +572,7 @@ function parseRoleToken(req, res) {
   return { role, token };
 }
 
-app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' }), (req, res) => {
+app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' }), async (req, res) => {
   const parsed = parseRoleToken(req, res);
   if (!parsed) return;
   const { role, token } = parsed;
@@ -503,6 +586,19 @@ app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' 
   console.log(`[relay] ${ts()} http-send ${role} room ${label} bytes=${body.length} text=${isText}`);
 
   const outcome = routeMessage(room, role, body, !isText);
+
+  // Backpressure for byte streams: the sender posts strictly one chunk at a
+  // time, so holding this response while the peer's queue is big stalls the
+  // sender (and, on the kiosk, its reads from TightVNC) instead of letting the
+  // queue grow without bound. Nothing is dropped; it just waits for the peer.
+  const peerRole = ROLE_PAIRS[role];
+  if (outcome === 'buffered' && isByteStreamRole(role) && pendingByteLength(room.pending[peerRole]) > STREAM_HIGH_WATER_BYTES) {
+    const t0 = Date.now();
+    while (rooms.has(token) && pendingByteLength(room.pending[peerRole]) > STREAM_LOW_WATER_BYTES && Date.now() - t0 < 20000) {
+      await waitForWake(room, `${role}:drained`, 250);
+    }
+    console.log(`[relay] ${ts()} http-send ${role} room ${label} held ${Date.now() - t0}ms for backpressure (peer backlog=${pendingByteLength(room.pending[peerRole])})`);
+  }
   res.json({ ok: true, outcome });
 });
 
@@ -536,7 +632,11 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
   let closed = false;
   while (true) {
     const queue = room.pending[role];
-    if (queue.length) { messages = queue.splice(0, queue.length); break; }
+    if (queue.length) {
+      messages = queue.splice(0, queue.length);
+      wakeWaiters(room, `${ROLE_PAIRS[role]}:drained`); // release a /send held by backpressure
+      break;
+    }
     if (room.peerClosed[role]) { closed = true; break; }
     const remaining = deadline - Date.now();
     if (remaining <= 0 || clientGone) break;
@@ -559,7 +659,12 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
   }
 
   if (messages.length) {
-    console.log(`[relay] ${ts()} http-recv ${role} room ${label} delivering=${messages.length}`);
+    let bytes = 0;
+    for (const m of messages) {
+      bytes += m.data.length;
+      if (isByteStreamRole(role) && m.isBinary) tapOf(room, ROLE_PAIRS[role], 'out').feed(asBuf(m.data));
+    }
+    console.log(`[relay] ${ts()} http-recv ${role} room ${label} delivering=${messages.length} bytes=${bytes}`);
   }
 
   res.json({
@@ -587,6 +692,28 @@ app.post('/rt/:role/:token/close', (req, res) => {
     }
     cleanupIfEmpty(token, room);
   }
+  res.json({ ok: true });
+});
+
+// POST /rt/<role>/<token>/reset - forget everything queued for this role AND its
+// peer, and restart the stream counters. A new VNC session (the kiosk agent
+// opening a fresh TCP connection to TightVNC) is a brand-new byte stream, so
+// bytes left over from a previous session under the same token must not be
+// delivered in front of it. Used by the manual test script, which reuses a
+// fixed token; harmless for normal one-time tokens.
+app.post('/rt/:role/:token/reset', (req, res) => {
+  const parsed = parseRoleToken(req, res);
+  if (!parsed) return;
+  const { role, token } = parsed;
+  const room = getRoom(token);
+  for (const r of [role, ROLE_PAIRS[role]]) {
+    room.pending[r].length = 0;
+    room.peerClosed[r] = false;
+    wakeWaiters(room, r);
+  }
+  room.taps = {};
+  room.httpSeen[role] = Date.now();
+  console.log(`[relay] ${ts()} http-reset ${role} room ${roomLabel(token)} (queues and stream counters cleared)`);
   res.json({ ok: true });
 });
 

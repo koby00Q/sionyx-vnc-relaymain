@@ -21,6 +21,43 @@ const HTTP_WAIT_MS = 20000;
 const HTTP_RECV_TIMEOUT_MS = 35000;
 const HTTP_MAX_FAILURES = 6;
 
+
+// ---- optional stream tap (vnc.html?debug=1) --------------------------------
+// Logs a running byte count + CRC32 of the VNC byte stream at fixed offsets
+// (every 64 KiB for the first MiB, then every MiB) - the same offsets the
+// server ([tap] lines in the Render log) and the kiosk test script print. The
+// first offset where two hops disagree on the crc is where the stream broke.
+const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function tapNext(off) {
+  return off < 1048576 ? (Math.floor(off / 65536) + 1) * 65536 : (Math.floor(off / 1048576) + 1) * 1048576;
+}
+class StreamTap {
+  constructor(label) { this.label = label; this.total = 0; this.c = 0xFFFFFFFF; }
+  feed(u8) {
+    let pos = 0;
+    while (pos < u8.length) {
+      const next = tapNext(this.total);
+      const end = pos + Math.min(u8.length - pos, next - this.total);
+      let c = this.c;
+      for (let i = pos; i < end; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+      this.c = c;
+      this.total += end - pos; pos = end;
+      if (this.total === next) {
+        console.log(`[tap] ${new Date().toISOString()} ${this.label} @${this.total} crc=${((this.c ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, '0')}`);
+      }
+    }
+  }
+}
+
 // readyState values match WebSocket.* (CONNECTING/OPEN/CLOSING/CLOSED).
 const CONNECTING = 0, OPEN = 1, CLOSED = 3;
 
@@ -31,8 +68,11 @@ let wsKnownBad = false;
 // One class (no subclasses) on purpose: noVNC checks that the required
 // properties exist on the object or its immediate prototype.
 export class RelayChannel {
-  constructor(backend, transportName) {
+  constructor(backend, transportName, role) {
     this.binaryType = 'arraybuffer';
+    // Only the main VNC stream (role 'viewer') is tapped, and only in debug mode.
+    this._tapIn = DEBUG && role === 'viewer' ? new StreamTap('browser viewer.in (agent->browser)') : null;
+    this._tapOut = DEBUG && role === 'viewer' ? new StreamTap('browser viewer.sent (browser->agent)') : null;
     this.protocol = '';
     this.onopen = null;
     this.onclose = null;
@@ -52,10 +92,16 @@ export class RelayChannel {
     this._onmessage = fn;
     if (fn && this._rq.length) setTimeout(() => this._drain(), 0);
   }
-  send(data) { this._backend.send(data); }
+  send(data) {
+    if (this._tapOut && typeof data !== 'string') this._tapOut.feed(new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength));
+    this._backend.send(data);
+  }
   close() { this._backend.close(); }
 
-  _deliver(data) { this._rq.push(data); this._drain(); }
+  _deliver(data) {
+    if (this._tapIn && typeof data !== 'string') this._tapIn.feed(new Uint8Array(data));
+    this._rq.push(data); this._drain();
+  }
   _drain() {
     while (this._onmessage && this._rq.length) this._onmessage({ data: this._rq.shift() });
   }
@@ -111,7 +157,7 @@ function tryWebSocket(role, token) {
     const channel = new RelayChannel({
       send: (d) => ws.send(d),
       close: () => { try { ws.close(); } catch { /* ignore */ } },
-    }, 'ws');
+    }, 'ws', role);
 
     ws.onmessage = (e) => {
       if (!settled) {
@@ -207,7 +253,7 @@ async function httpChannel(role, token) {
       channel._setClosed(true);
     },
   };
-  const channel = new RelayChannel(backend, 'http');
+  const channel = new RelayChannel(backend, 'http', role);
 
   function fatal(msg) {
     if (closed) return;
