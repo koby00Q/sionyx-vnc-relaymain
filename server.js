@@ -29,6 +29,9 @@
 // transports for the exact same <token> room:
 //   - WebSocket, unchanged, at /agent|viewer|controlAgent|controlViewer/<token>
 //   - HTTP long-poll, new, at /rt/<role>/<token>/{send,recv,close}
+// Clients that connect with ?probe=1 must pass a liveness probe before they
+// are routed anything (see PROBE_MESSAGE) - this is what makes the fallback
+// safe when NetFree hands the client a 418 for an upgrade we accepted.
 // One side of a room can be on WebSocket while the other is on HTTP -
 // the room-pairing logic below doesn't care which transport either side
 // used, only the <token> and role.
@@ -170,11 +173,55 @@ const BACKPRESSURE_THRESHOLD_BYTES = 1 * 1024 * 1024; // 1MB
 // ("joined" vs silently queuing for a room nobody is polling any more).
 const HTTP_ACTIVE_WINDOW_MS = 30000;
 
+// Liveness probe for WebSocket clients that connect with ?probe=1 (the new
+// kiosk build and vnc.html). NetFree can hand the client a 418 (or silently
+// swallow traffic) while this server has already accepted the upgrade - a
+// "ghost" connection that looks perfectly healthy from here. A probing client
+// sends PROBE right after connecting; the server answers ACK. Only once the
+// client has seen the ACK (i.e. the connection provably works in BOTH
+// directions) is the socket treated as usable: before that, nothing is routed
+// or flushed to it and a newcomer may replace it. Clients that don't ask for
+// probing (old builds, the local relay) behave exactly as before.
+const PROBE_MESSAGE = '__relay_probe__';
+const PROBE_ACK = '__relay_probe_ack__';
+
+function httpActive(room, role) {
+  const seen = room.httpSeen[role];
+  return !!seen && (Date.now() - seen) < HTTP_ACTIVE_WINDOW_MS;
+}
+
+// A WebSocket that is open and (if it asked for probing) proved it works.
+function wsUsable(ws) {
+  return !!ws && ws.readyState === WebSocket.OPEN && ws._ready !== false;
+}
+
+function wakeWaiters(room, role) {
+  const list = room.waiters[role];
+  if (!list.length) return;
+  room.waiters[role] = [];
+  for (const fn of list) fn();
+}
+
+// Resolves when something is queued/changed for <role>, or after ms.
+function waitForWake(room, role, ms) {
+  return new Promise((resolve) => {
+    let timer;
+    const done = () => { clearTimeout(timer); resolve(); };
+    timer = setTimeout(() => {
+      room.waiters[role] = room.waiters[role].filter((f) => f !== done);
+      resolve();
+    }, ms);
+    room.waiters[role].push(done);
+  });
+}
+
 function getRoom(token) {
   let room = rooms.get(token);
   if (!room) {
-    room = { pending: {}, httpSeen: {} };
-    for (const role of ROLES) { room[role] = null; room.pending[role] = []; }
+    room = { pending: {}, httpSeen: {}, peerClosed: {}, waiters: {} };
+    for (const role of ROLES) {
+      room[role] = null; room.pending[role] = []; room.peerClosed[role] = false; room.waiters[role] = [];
+    }
     rooms.set(token, room);
   }
   return room;
@@ -182,10 +229,7 @@ function getRoom(token) {
 
 function cleanupIfEmpty(token, room) {
   const anyWs = ROLES.some((role) => !!room[role]);
-  const anyHttp = ROLES.some((role) => {
-    const seen = room.httpSeen[role];
-    return seen && (Date.now() - seen) < HTTP_ACTIVE_WINDOW_MS;
-  });
+  const anyHttp = ROLES.some((role) => httpActive(room, role));
   if (!anyWs && !anyHttp) rooms.delete(token);
 }
 
@@ -199,6 +243,7 @@ function bufferForPeer(room, peerRole, data, isBinary) {
   while (queue.length > MAX_PENDING_MESSAGES || pendingByteLength(queue) > MAX_PENDING_BYTES) {
     queue.shift();
   }
+  wakeWaiters(room, peerRole);
 }
 
 function flushPending(room, role, ws) {
@@ -218,7 +263,10 @@ function flushPending(room, role, ws) {
 function routeMessage(room, role, data, isBinary) {
   const peerRole = ROLE_PAIRS[role];
   const peer = room[peerRole];
-  if (peer && peer.readyState === WebSocket.OPEN) {
+  // Prefer HTTP if the peer is currently talking to us over HTTP: a ghost
+  // WebSocket (see PROBE_MESSAGE) may still be registered for that role, and
+  // anything sent into it would vanish.
+  if (wsUsable(peer) && !httpActive(room, peerRole)) {
     peer.send(data, { binary: isBinary });
     if (peer.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES) {
       return 'peer-backpressured'; // caller decides what to do (WS path pauses; HTTP path ignores - no socket to pause)
@@ -292,8 +340,9 @@ wss.on('connection', (ws, req) => {
 
   const room = getRoom(token);
   const label = roomLabel(token);
+  const wantProbe = url.searchParams.get('probe') === '1';
 
-  console.log(`[relay] ${ts()} responding to upgrade with 101 for ${role} in room ${label}`);
+  console.log(`[relay] ${ts()} responding to upgrade with 101 for ${role} in room ${label}${wantProbe ? ' (probe requested)' : ''}`);
 
   // A new connection for a role replaces a STALE one (e.g. a page reload,
   // or the kiosk's WS reconnecting after a real network blip). But if the
@@ -305,7 +354,10 @@ wss.on('connection', (ws, req) => {
   // instead and let the existing session keep running.
   const existing = room[role];
   if (existing) {
+    // An existing probing connection that never passed its probe is a ghost
+    // (NetFree ate the handshake response) - always replaceable.
     const isStale = existing.readyState !== WebSocket.OPEN
+      || existing._ready === false
       || (Date.now() - (existing.lastActivity || 0)) > STALE_CONNECTION_MS;
     if (!isStale) {
       console.log(`[relay] ${ts()} rejecting duplicate ${role} connection for room ${label} - existing connection still active`);
@@ -319,19 +371,33 @@ wss.on('connection', (ws, req) => {
   ws._token = token;
   ws._msgsIn = 0;
   ws._openedAt = Date.now();
+  ws._ready = !wantProbe; // false until the probe arrives (probing clients only)
+  room.peerClosed[ROLE_PAIRS[role]] = false; // this role is (re)joining
   startHeartbeat(ws);
 
   console.log(`[relay] ${ts()} ${role} joined room ${label} (${ROLES.map((r) => `${r}=${!!room[r]}`).join(' ')})`);
 
   // Send anything that arrived for this role before it joined (e.g. the
   // agent's initial VNC handshake bytes sent before the viewer loaded).
-  flushPending(room, role, ws);
+  // Probing clients get this only after their probe succeeds (see below).
+  if (ws._ready) flushPending(room, role, ws);
 
   ws.on('message', (data, isBinary) => {
     ws.lastActivity = Date.now();
     ws._msgsIn += 1;
     const r = rooms.get(token);
     if (!r) return;
+
+    if (!isBinary && data.length === PROBE_MESSAGE.length && data.toString() === PROBE_MESSAGE) {
+      // Liveness probe: never routed to the peer.
+      const first = !ws._ready;
+      ws._ready = true;
+      ws.send(PROBE_ACK, { binary: false });
+      console.log(`[relay] ${ts()} ${role} probe ok in room ${label}${first ? ' - now active' : ''}`);
+      if (first) flushPending(r, role, ws);
+      return;
+    }
+    if (!ws._ready) return; // data from a probing client that hasn't proven itself yet
     const outcome = routeMessage(r, role, data, isBinary);
     if (outcome === 'peer-backpressured') {
       // Backpressure: while the screen is static there's almost no traffic,
@@ -367,7 +433,15 @@ wss.on('connection', (ws, req) => {
     );
     const r = rooms.get(token);
     if (!r) return;
-    if (r[role] === ws) r[role] = null;
+    if (r[role] === ws) {
+      r[role] = null;
+      // Tell an HTTP-side peer that this side is gone (a ghost that never
+      // passed its probe doesn't count, nor does a role still active over HTTP).
+      if (ws._ready && !httpActive(r, role)) {
+        r.peerClosed[ROLE_PAIRS[role]] = true;
+        wakeWaiters(r, ROLE_PAIRS[role]);
+      }
+    }
     cleanupIfEmpty(token, r);
   });
 
@@ -415,7 +489,7 @@ function parseRoleToken(req, res) {
   return { role, token };
 }
 
-app.post('/rt/:role/:token/send', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
+app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' }), (req, res) => {
   const parsed = parseRoleToken(req, res);
   if (!parsed) return;
   const { role, token } = parsed;
@@ -425,6 +499,7 @@ app.post('/rt/:role/:token/send', express.raw({ type: '*/*', limit: '10mb' }), (
   const body = req.body && req.body.length ? req.body : Buffer.alloc(0);
 
   room.httpSeen[role] = Date.now();
+  room.peerClosed[ROLE_PAIRS[role]] = false;
   console.log(`[relay] ${ts()} http-send ${role} room ${label} bytes=${body.length} text=${isText}`);
 
   const outcome = routeMessage(room, role, body, !isText);
@@ -438,8 +513,9 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
   const room = getRoom(token);
   const label = roomLabel(token);
 
-  const wasActive = room.httpSeen[role] && (Date.now() - room.httpSeen[role]) < HTTP_ACTIVE_WINDOW_MS;
+  const wasActive = httpActive(room, role);
   room.httpSeen[role] = Date.now();
+  room.peerClosed[ROLE_PAIRS[role]] = false;
   if (!wasActive) {
     console.log(`[relay] ${ts()} ${role} joined room ${label} over HTTP`);
   }
@@ -447,21 +523,39 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
   const requestedWait = parseInt(req.query.wait, 10);
   const waitMs = Number.isFinite(requestedWait) ? Math.min(Math.max(requestedWait, 0), 25000) : 20000;
 
+  // If the client hangs up mid-poll (its own timeout, a network blip), we
+  // must not hand the messages we were about to deliver to nobody - for a VNC
+  // byte stream that would corrupt the session. Track it and re-queue below.
+  let clientGone = false;
+  res.on('close', () => {
+    if (!res.writableEnded) { clientGone = true; wakeWaiters(room, role); }
+  });
+
   const deadline = Date.now() + waitMs;
   let messages = [];
-  while (Date.now() < deadline) {
+  let closed = false;
+  while (true) {
     const queue = room.pending[role];
-    if (queue.length) {
-      messages = queue.slice();
-      queue.length = 0;
-      break;
-    }
-    await sleep(150);
-    // The room may have been garbage-collected (cleanupIfEmpty) if this poll
-    // has been running a very long time with everyone else gone - bail out
-    // rather than trust a closed-over reference to a room that no longer
-    // exists in the map.
+    if (queue.length) { messages = queue.splice(0, queue.length); break; }
+    if (room.peerClosed[role]) { closed = true; break; }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || clientGone) break;
+    await waitForWake(room, role, remaining);
+    // The room may have been garbage-collected while we waited.
     if (!rooms.has(token)) break;
+  }
+
+  if (clientGone) {
+    if (messages.length) room.pending[role].unshift(...messages);
+    return;
+  }
+
+  room.httpSeen[role] = Date.now();
+
+  // VNC byte streams don't care about message boundaries, so merge a backlog
+  // into one message: far fewer base64 items and round trips.
+  if (messages.length > 1 && messages.every((m) => m.isBinary) && (role === 'agent' || role === 'viewer')) {
+    messages = [{ data: Buffer.concat(messages.map((m) => Buffer.from(m.data))), isBinary: true }];
   }
 
   if (messages.length) {
@@ -473,6 +567,7 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
       data: Buffer.from(data).toString('base64'),
       binary: isBinary,
     })),
+    ...(closed ? { closed: true } : {}),
   });
 });
 
@@ -485,10 +580,21 @@ app.post('/rt/:role/:token/close', (req, res) => {
   console.log(`[relay] ${ts()} http-close ${role} room ${label}`);
   if (room) {
     delete room.httpSeen[role];
+    const ws = room[role];
+    if (!(ws && wsUsable(ws))) {
+      room.peerClosed[ROLE_PAIRS[role]] = true;
+      wakeWaiters(room, ROLE_PAIRS[role]);
+    }
     cleanupIfEmpty(token, room);
   }
   res.json({ ok: true });
 });
+
+// HTTP-only rooms have no socket 'close' event to clean them up, so sweep
+// rooms nobody has touched recently (WebSocket rooms clean up on close).
+setInterval(() => {
+  for (const [token, room] of rooms) cleanupIfEmpty(token, room);
+}, 60000).unref();
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`[relay] ${ts()} listening on ${PORT} (node ${process.version}, pid ${process.pid})`));
