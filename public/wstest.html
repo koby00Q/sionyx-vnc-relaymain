@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>בדיקת WebSocket</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 46rem; }
+  button { padding: .5rem 1rem; font-size: 1rem; }
+  pre { background: #111; color: #ddd; padding: 1rem; direction: ltr; text-align: left; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>בדיקת חיבור מהדפדפן</h1>
+<p>הדף נטען מהרלי עצמו, אז זה אותו origin ואותה רשת שבהם ה-viewer האמיתי עובד. הבדיקה פותחת agent ו-viewer מהדפדפן הזה, לאותו טוקן חדש.</p>
+<button id="run">הרץ בדיקה</button>
+<pre id="out">מוכן.</pre>
+<script>
+const out = document.getElementById('out');
+const log = (m) => { out.textContent += '\n' + new Date().toISOString().slice(11, 23) + '  ' + m; };
+// Same label the relay prints in its logs: first 6 chars + '#' + 4 hex of sha1.
+async function roomLabel(t) {
+  const d = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(t));
+  return t.slice(0, 6) + '#' + [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 4);
+}
+
+function tryWs(role, token) {
+  return new Promise((resolve) => {
+    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${role}/${token}`;
+    const t0 = performance.now();
+    let opened = false;
+    const ws = new WebSocket(url);
+    const timer = setTimeout(() => { log(`${role}: TIMEOUT אחרי 10 שניות`); resolve(null); }, 10000);
+    ws.onopen = () => { opened = true; log(`${role}: OPEN אחרי ${Math.round(performance.now() - t0)}ms`); clearTimeout(timer); resolve(ws); };
+    ws.onerror = () => log(`${role}: ERROR (הדפדפן לא חושף את הסיבה - ראה Network או את הלוגים של Render)`);
+    ws.onclose = (e) => {
+      log(`${role}: CLOSE code=${e.code} reason="${e.reason}" wasOpen=${opened}`);
+      if (!opened) { clearTimeout(timer); resolve(null); }
+    };
+  });
+}
+
+document.getElementById('run').onclick = async () => {
+  out.textContent = '';
+  const token = 'wstest-' + Math.random().toString(36).slice(2, 10);
+  log(`טוקן: ${token}`);
+  try {
+    const r = await fetch('/whoami', { cache: 'no-store' });
+    log(`GET /whoami -> ${r.status}`);
+    log(JSON.stringify(await r.json()));
+  } catch (e) { log('GET /whoami נכשל: ' + e.message); }
+
+  const agent = await tryWs('agent', token);
+  await new Promise((r) => setTimeout(r, 500));
+  const viewer = await tryWs('viewer', token);
+
+  if (agent && viewer) {
+    viewer.onmessage = (e) => log(`viewer קיבל: ${e.data}`);
+    agent.send('hello-from-agent');
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  [agent, viewer].forEach((w) => { try { w && w.close(1000, 'test done'); } catch {} });
+  log('סיום. בלוגים של Render חפש את החדר: ' + await roomLabel(token));
+};
+</script>
+</body>
+</html>
