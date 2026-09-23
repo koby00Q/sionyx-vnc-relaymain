@@ -57,7 +57,7 @@ const app = express();
 
 // Plain HTTP request log (skips /health so Render's health checks don't spam).
 app.use((req, res, next) => {
-  if (req.path === '/health') return next();
+  if (req.path === '/health' || req.path.startsWith('/rt/')) return next();
   const t0 = Date.now();
   res.on('finish', () => {
     log(`http ${req.method} ${maskPath(req.originalUrl)} -> ${res.statusCode} ${Date.now() - t0}ms ip=${clientIp(req)} ua="${short(req.headers['user-agent'])}"`);
@@ -72,6 +72,10 @@ app.get('/whoami', (req, res) => {
   const { cookie, authorization, ...headers } = req.headers;
   res.json({ time: new Date().toISOString(), uptimeSeconds: Math.round(process.uptime()), ip: clientIp(req), headers });
 });
+
+// Plain-HTTPS transport (no WebSocket upgrade) - see the "HTTP transport"
+// section further down. Same rooms/roles as the WebSocket path.
+app.use((req, res, next) => (req.path.startsWith('/rt/') ? handleRt(req, res) : next()));
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (_req, res) => res.status(200).send('SIONYX VNC Relay is up'));
@@ -343,6 +347,221 @@ wss.on('connection', (ws, req) => {
     log(`${ws.logName} socket error: ${err.code || ''} ${err.message}`);
   });
 });
+
+// ---- HTTP transport (no WebSocket) ------------------------------------------
+// Why this exists: NetFree answers WebSocket upgrade requests to this host with
+// "418 Blocked by NetFree" even though the relay accepts them (the relay logs
+// "responding to ...: 101 Switching Protocols" for the very same requests). Plain
+// HTTPS requests to the same host do pass. So a client can take part in a room
+// using ordinary requests instead of an upgrade:
+//
+//   POST /rt/<role>/<token>/send            body = one message (raw bytes)
+//        add ?t=1 to mark it as a text message (default: binary)
+//   GET  /rt/<role>/<token>/recv?wait=20000 long-poll: returns as soon as a
+//        message is waiting for this role, or after `wait` ms with an empty list
+//        -> 200 {"m":[{"b":1,"d":"<base64>"}],"closed":false}
+//   POST /rt/<role>/<token>/close           leave the room
+//
+// <role> and <token> are exactly the same as in /agent/<token> etc., and an
+// HTTP client and a WebSocket client can be the two sides of the same room.
+// The WebSocket path above is untouched.
+const HTTP_PEER_IDLE_MS = 45000;          // no request at all for this long -> session ends
+const MAX_HTTP_QUEUE_BYTES = 20 * 1024 * 1024;
+const MAX_POST_BYTES = 1024 * 1024;
+const MAX_POLL_WAIT_MS = 25000;
+const POLL_MAX_BYTES = 2 * 1024 * 1024;   // per poll response, raw bytes
+
+// Stands in for a WebSocket in room[role]: it has the few members the WS code
+// touches on a *peer* (readyState, send, bufferedAmount, lastActivity, msgsOut, close).
+class HttpPeer {
+  constructor(token, role) {
+    this.isHttp = true;
+    this.token = token;
+    this.role = role;
+    this.readyState = WebSocket.OPEN;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.waiter = null;
+    this.lastActivity = Date.now();
+    this.joinedAt = Date.now();
+    this.msgsIn = 0;
+    this.bytesIn = 0;
+    this.msgsOut = 0;
+    this.logName = `${role}(http)@${roomLabel(token)}`;
+    this.timer = setInterval(() => {
+      if (Date.now() - this.lastActivity > HTTP_PEER_IDLE_MS) this.close('idle');
+    }, 5000);
+  }
+
+  get bufferedAmount() { return this.queuedBytes; }
+
+  send(data, opts) {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (this.queuedBytes + buf.length > MAX_HTTP_QUEUE_BYTES) {
+      log(`${this.logName} queue overflow (${this.queuedBytes} bytes waiting) - ending session`);
+      this.close('queue overflow');
+      return;
+    }
+    this.queue.push({ b: opts && opts.binary ? 1 : 0, d: buf.toString('base64'), n: buf.length });
+    this.queuedBytes += buf.length;
+    this.wake();
+  }
+
+  wake() {
+    if (!this.waiter) return;
+    const w = this.waiter;
+    this.waiter = null;
+    w();
+  }
+
+  // close(reason): the session ended by itself (idle / overflow / client 'close').
+  // close() with no argument is how the WebSocket code evicts a stale role holder;
+  // in that case the caller is about to put its own socket in room[role], so leave
+  // the room bookkeeping alone.
+  close(reason) {
+    if (this.readyState !== WebSocket.OPEN) return;
+    this.readyState = WebSocket.CLOSED;
+    clearInterval(this.timer);
+    this.wake();
+    log(`${this.logName} closed (${reason || 'replaced'}) lived=${Date.now() - this.joinedAt}ms msgsIn=${this.msgsIn} bytesIn=${this.bytesIn} msgsOut=${this.msgsOut}`);
+    if (reason === undefined) return;
+    const r = rooms.get(this.token);
+    if (r && r[this.role] === this) { r[this.role] = null; cleanupIfEmpty(this.token, r); }
+  }
+}
+
+// Returns the live HttpPeer for this role, creating it (and joining the room) if
+// needed. Returns null if a different, still-active connection holds the role.
+function getHttpPeer(role, token, req) {
+  const room = getRoom(token);
+  const existing = room[role];
+  if (existing && existing.isHttp && existing.readyState === WebSocket.OPEN) return existing;
+  if (existing) {
+    const idle = Date.now() - (existing.lastActivity || 0);
+    if (existing.readyState === WebSocket.OPEN && idle <= STALE_CONNECTION_MS) {
+      log(`rejecting http ${role} for room ${roomLabel(token)} - existing connection still active (idle ${idle}ms)`);
+      return null;
+    }
+    log(`replacing stale ${role} in room ${roomLabel(token)} with an http session (idle ${idle}ms)`);
+    try { existing.close(); } catch { /* ignore */ }
+  }
+  const peer = new HttpPeer(token, role);
+  room[role] = peer;
+  log(`${role}(http) joined room ${roomLabel(token)} (${ROLES.map((r) => `${r}=${!!room[r]}`).join(' ')}) ip=${clientIp(req)} ua="${short(req.headers['user-agent'])}"`);
+  flushPending(room, role, peer);
+  return peer;
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+
+function pollRespond(peer, res) {
+  const items = [];
+  let bytes = 0;
+  while (peer.queue.length && bytes < POLL_MAX_BYTES) {
+    const it = peer.queue.shift();
+    peer.queuedBytes -= it.n;
+    bytes += it.n;
+    items.push({ b: it.b, d: it.d });
+  }
+  sendJson(res, 200, { m: items, closed: peer.readyState !== WebSocket.OPEN });
+}
+
+function handleRt(req, res) {
+  const url = new URL(req.url, 'http://relay.local');
+  // req.path may or may not include the "/rt" prefix depending on how it was mounted;
+  // parse from the full original URL so it never matters.
+  const parts = new URL(req.originalUrl || req.url, 'http://relay.local').pathname.split('/').filter(Boolean);
+  const [, role, token, action] = parts; // ['rt', role, token, action]
+  if (!ROLE_PAIRS[role] || !token || token.length < 8 || !['send', 'recv', 'close'].includes(action)) {
+    log(`http rt: bad path (role=${role} tokenLength=${token ? token.length : 0} action=${action})`);
+    return sendJson(res, 400, { error: 'expected /rt/<role>/<token>/send|recv|close' });
+  }
+  const peerRole = ROLE_PAIRS[role];
+
+  if (action === 'recv') {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'use GET' });
+    const peer = getHttpPeer(role, token, req);
+    if (!peer) return sendJson(res, 409, { error: 'role already active' });
+    peer.lastActivity = Date.now();
+    peer.wake(); // release an older poll that is still waiting, if any
+    const waitMs = Math.max(0, Math.min(Number(url.searchParams.get('wait')) || 0, MAX_POLL_WAIT_MS));
+    if (peer.queue.length || peer.readyState !== WebSocket.OPEN || waitMs === 0) return pollRespond(peer, res);
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (peer.waiter === finish) peer.waiter = null;
+      peer.lastActivity = Date.now();
+      pollRespond(peer, res);
+    };
+    const timer = setTimeout(finish, waitMs);
+    peer.waiter = finish;
+    res.on('close', () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (peer.waiter === finish) peer.waiter = null;
+    });
+    return undefined;
+  }
+
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'use POST' });
+
+  if (action === 'close') {
+    const r = rooms.get(token);
+    const cur = r && r[role];
+    if (cur && cur.isHttp) cur.close('client close');
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // action === 'send'
+  const isBinary = url.searchParams.get('t') !== '1';
+  const chunks = [];
+  let size = 0;
+  let tooBig = false;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > MAX_POST_BYTES) { tooBig = true; return; }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    if (tooBig) return sendJson(res, 413, { error: `message over ${MAX_POST_BYTES} bytes` });
+    const sender = getHttpPeer(role, token, req);
+    if (!sender) return sendJson(res, 409, { error: 'role already active' });
+    sender.lastActivity = Date.now();
+    const data = Buffer.concat(chunks);
+    sender.msgsIn += 1;
+    sender.bytesIn += data.length;
+    if (sender.msgsIn === 1) log(`${sender.logName} first message: ${data.length} bytes ${isBinary ? 'binary' : 'text'} (${Date.now() - sender.joinedAt}ms after joining)`);
+
+    const r = rooms.get(token);
+    const other = r && r[peerRole];
+    if (other && other.readyState === WebSocket.OPEN) {
+      other.send(data, { binary: isBinary });
+      other.msgsOut = (other.msgsOut || 0) + 1;
+      // Backpressure for an HTTP sender: hold the response until the receiver
+      // has drained (the sender's next POST then naturally waits too).
+      const t0 = Date.now();
+      const waitDrain = () => {
+        if (other.readyState !== WebSocket.OPEN || other.bufferedAmount <= BACKPRESSURE_THRESHOLD_BYTES || Date.now() - t0 > 5000) {
+          return sendJson(res, 200, { ok: true, delivered: true });
+        }
+        return setTimeout(waitDrain, 50);
+      };
+      return waitDrain();
+    }
+    if (r) {
+      if (r.pending[peerRole].length === 0) log(`${sender.logName}: peer ${peerRole} not connected, buffering messages for it`);
+      bufferForPeer(r, peerRole, data, isBinary);
+    }
+    return sendJson(res, 200, { ok: true, delivered: false });
+  });
+  return undefined;
+}
 
 // Fires only when the relay ACCEPTS a handshake, right before it writes the
 // "101 Switching Protocols" response. If this line appears for an attempt
