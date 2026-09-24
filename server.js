@@ -698,16 +698,23 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
     let bytes = 0;
     for (const m of messages) {
       bytes += m.data.length;
-      if (isByteStreamRole(role) && m.isBinary) tapOf(room, ROLE_PAIRS[role], 'out').feed(asBuf(m.data));
+      if (isByteStreamRole(role) && m.isBinary) {
+        const tap = tapOf(room, ROLE_PAIRS[role], 'out');
+        m.off = tap.total; // stream offset of this message's first byte
+        tap.feed(asBuf(m.data));
+      }
+      if (m.isBinary && zlibCrc32) m.crc = zlibCrc32(asBuf(m.data)) >>> 0;
     }
     console.log(`[relay] ${ts()} http-recv ${role} room ${label} delivering=${messages.length} bytes=${bytes}`);
   }
 
   res.json({
-    messages: messages.map(({ data, isBinary }) => ({
+    messages: messages.map(({ data, isBinary, off, crc }) => ({
       data: Buffer.from(data).toString('base64'),
       len: Buffer.from(data).length,
       binary: isBinary,
+      ...(off !== undefined ? { off } : {}),
+      ...(crc !== undefined ? { crc } : {}),
     })),
     ...(closed ? { closed: true } : {}),
   });

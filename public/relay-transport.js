@@ -309,9 +309,36 @@ async function httpChannel(role, token) {
     channel._setClosed(false);
   }
 
+  // Per-message integrity check (the relay sends offset, length and CRC32 of
+  // every message): pinpoints a lost / duplicated / altered message exactly,
+  // not just to the nearest 8 KiB checkpoint.
+  let expectOff = 0, msgCount = 0;
+  function crc32(u8) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function integrityProblem(msg) {
+    console.error('[relay] INTEGRITY PROBLEM ' + msg);
+    if (DEBUG) {
+      const d = document.createElement('pre');
+      d.textContent = 'INTEGRITY PROBLEM\n' + msg;
+      d.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;z-index:99999;background:#400c;color:#ff9b9b;padding:10px;font:14px Consolas,monospace;white-space:pre-wrap;border:1px solid #ff9b9b';
+      document.body.appendChild(d);
+    }
+  }
   function handle(payload) {
     for (const m of payload.messages || []) {
       const bytes = b64ToBytes(m.data);
+      msgCount++;
+      if (DEBUG && m.binary && m.off !== undefined) {
+        const problems = [];
+        if (m.off !== expectOff) problems.push(`offset: relay says message starts at ${m.off}, browser expected ${expectOff} (${m.off > expectOff ? 'GAP of ' + (m.off - expectOff) : 'DUPLICATE/REORDER of ' + (expectOff - m.off)} bytes)`);
+        if (m.len !== bytes.length) problems.push(`length: relay sent ${m.len}, browser decoded ${bytes.length}`);
+        else if (m.crc !== undefined && crc32(bytes) !== m.crc) problems.push(`crc: relay ${m.crc.toString(16)}, browser ${crc32(bytes).toString(16)} (same length, content changed)`);
+        if (problems.length) integrityProblem(`message #${msgCount}: ${problems.join('; ')}`);
+        expectOff = m.off + m.len;
+      }
       channel._deliver(m.binary ? bytes.buffer : new TextDecoder().decode(bytes));
     }
   }
