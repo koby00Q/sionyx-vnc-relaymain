@@ -302,6 +302,8 @@ function pendingByteLength(queue) {
 //   - and if the queue still grows past HARD_CAP the session is closed loudly
 //     (both sides see a disconnect) rather than delivering a corrupted stream.
 // Control channels (JSON messages, occasional) keep the old drop-oldest cap.
+// Max raw bytes per /recv response (see the NetFree note in the recv handler).
+const RECV_MAX_BYTES = 16000;
 const STREAM_HARD_CAP_BYTES = 64 * 1024 * 1024;
 const STREAM_HIGH_WATER_BYTES = 2 * 1024 * 1024; // /send stalls above this
 const STREAM_LOW_WATER_BYTES = 512 * 1024;       // ...until it drains below this
@@ -658,6 +660,19 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
     messages = [{ data: Buffer.concat(messages.map((m) => Buffer.from(m.data))), isBinary: true }];
   }
 
+  // NetFree (TLS interception) truncates large /recv responses: measured from
+  // the kiosk, up to 21,336 base64 chars arrive intact (16,000 bytes) but
+  // anything bigger comes back cut at ~29,398 chars with the JSON tail still
+  // in place, i.e. corrupt base64 and a corrupted VNC stream. So never answer
+  // with more than RECV_MAX_BYTES of a byte stream; the rest goes back to the
+  // front of the queue and the client's next poll (issued immediately) gets it.
+  if (isByteStreamRole(role) && messages.length === 1 && messages[0].isBinary && messages[0].data.length > RECV_MAX_BYTES) {
+    const whole = Buffer.from(messages[0].data);
+    messages = [{ data: whole.subarray(0, RECV_MAX_BYTES), isBinary: true }];
+    room.pending[role].unshift({ data: whole.subarray(RECV_MAX_BYTES), isBinary: true });
+    wakeWaiters(room, role);
+  }
+
   if (messages.length) {
     let bytes = 0;
     for (const m of messages) {
@@ -670,6 +685,7 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
   res.json({
     messages: messages.map(({ data, isBinary }) => ({
       data: Buffer.from(data).toString('base64'),
+      len: Buffer.from(data).length,
       binary: isBinary,
     })),
     ...(closed ? { closed: true } : {}),
