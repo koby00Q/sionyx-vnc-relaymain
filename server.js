@@ -217,9 +217,15 @@ function tapNextCheckpoint(off) {
     : (Math.floor(off / TAP_COARSE_STEP) + 1) * TAP_COARSE_STEP;
 }
 const zlibCrc32 = require('zlib').crc32; // Node >= 20.15 / 22.2; taps are skipped on older Node
+const REC_MAX = 256 * 1024;
 class StreamTap {
-  constructor(label) { this.label = label; this.total = 0; this.crc = 0; }
+  constructor(label) { this.label = label; this.total = 0; this.crc = 0; this.rec = []; this.recLen = 0; }
   feed(buf) {
+    // Keep the first REC_MAX bytes so /dump can hand them back for a byte-exact diff.
+    if (this.recLen < REC_MAX) {
+      const part = Buffer.from(buf.subarray(0, REC_MAX - this.recLen));
+      this.rec.push(part); this.recLen += part.length;
+    }
     if (!zlibCrc32) { this.total += buf.length; return; }
     let pos = 0;
     while (pos < buf.length) {
@@ -233,11 +239,26 @@ class StreamTap {
     }
   }
 }
+const dumpStore = new Map(); // `${token}|${key}` -> { tap, at }
 function tapOf(room, role, kind) {
   const key = `${role}.${kind}`;
-  if (!room.taps[key]) room.taps[key] = new StreamTap(`${roomLabel(room.token)} ${key}`);
+  if (!room.taps[key]) {
+    room.taps[key] = new StreamTap(`${roomLabel(room.token)} ${key}`);
+    dumpStore.set(`${room.token}|${key}`, { tap: room.taps[key], at: Date.now() });
+    for (const [k, v] of dumpStore) if (Date.now() - v.at > 30 * 60 * 1000 || dumpStore.size > 60) dumpStore.delete(k);
+  }
   return room.taps[key];
 }
+// Debug: first 256 KiB of a hop's stream, e.g. /dump/<token>/agent.out (what was
+// delivered to the viewer) or /dump/<token>/agent.in (what the agent posted).
+// Same secret (the token) that already lets a viewer read the whole stream.
+app.get('/dump/:token/:key', (req, res) => {
+  const e = dumpStore.get(`${req.params.token}|${req.params.key}`);
+  if (!e) return res.status(404).send('no such dump');
+  res.set('Content-Type', 'application/octet-stream').set('Cache-Control', 'no-store');
+  res.set('X-Total', String(e.tap.total));
+  res.send(Buffer.concat(e.tap.rec));
+});
 const asBuf = (d) => (Buffer.isBuffer(d) ? d : Buffer.from(d));
 function isByteStreamRole(role) { return role === 'agent' || role === 'viewer'; }
 

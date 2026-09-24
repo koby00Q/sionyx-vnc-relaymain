@@ -72,6 +72,8 @@ export class RelayChannel {
     this.binaryType = 'arraybuffer';
     // Only the main VNC stream (role 'viewer') is tapped, and only in debug mode.
     this._tapIn = DEBUG && role === 'viewer' ? new StreamTap('browser viewer.in (agent->browser)') : null;
+    this._rec = DEBUG && role === 'viewer' ? [] : null; // first 256 KiB received, for the byte-exact diff on close
+    this._recLen = 0;
     this._tapOut = DEBUG && role === 'viewer' ? new StreamTap('browser viewer.sent (browser->agent)') : null;
     this.protocol = '';
     this.onopen = null;
@@ -100,10 +102,52 @@ export class RelayChannel {
 
   _deliver(data) {
     if (this._tapIn && typeof data !== 'string') this._tapIn.feed(new Uint8Array(data));
+    if (this._rec && typeof data !== 'string' && this._recLen < 262144) {
+      const part = new Uint8Array(data).slice(0, 262144 - this._recLen);
+      this._rec.push(part); this._recLen += part.length;
+    }
     this._rq.push(data); this._drain();
   }
   _drain() {
     while (this._onmessage && this._rq.length) this._onmessage({ data: this._rq.shift() });
+  }
+  async _compareWithServer() {
+    const lines = [];
+    const say = (t) => { lines.push(t); };
+    try {
+      const token = new URLSearchParams(location.search).get('token');
+      const mine = new Uint8Array(this._recLen);
+      let o = 0; for (const p of this._rec) { mine.set(p, o); o += p.length; }
+      const get = async (k) => {
+        const r = await fetch(`/dump/${encodeURIComponent(token)}/${k}`, { cache: 'no-store' });
+        if (!r.ok) return null;
+        return { bytes: new Uint8Array(await r.arrayBuffer()), total: r.headers.get('X-Total') };
+      };
+      const srvOut = await get('agent.out');
+      const srvIn = await get('agent.in');
+      const hex = (u, i) => Array.from(u.slice(Math.max(0, i - 6), i + 10)).map((b) => b.toString(16).padStart(2, '0')).join(' ');
+      const firstDiff = (a, b) => { const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i; return a.length === b.length ? -1 : n; };
+      say(`browser received: ${this._recLen} bytes (first 256KiB kept)`);
+      if (!srvOut) say('relay has no agent.out dump for this token');
+      else {
+        say(`relay delivered to viewer (agent.out): total=${srvOut.total}, kept=${srvOut.bytes.length}`);
+        const m = Math.min(mine.length, srvOut.bytes.length);
+        const d = firstDiff(mine.slice(0, m), srvOut.bytes.slice(0, m));
+        if (d === -1) say(`browser vs relay-out: IDENTICAL over first ${m} bytes`);
+        else say(`browser vs relay-out: FIRST DIFF at offset ${d}\n   browser: ${hex(mine, d)}\n   relay  : ${hex(srvOut.bytes, d)}`);
+      }
+      if (srvIn && srvOut) {
+        const m = Math.min(srvIn.bytes.length, srvOut.bytes.length);
+        const d = firstDiff(srvIn.bytes.slice(0, m), srvOut.bytes.slice(0, m));
+        say(`relay agent.in=${srvIn.total} bytes; in vs out: ${d === -1 ? 'IDENTICAL over ' + m + ' bytes' : 'FIRST DIFF at ' + d}`);
+      }
+    } catch (e) { say('compare error: ' + e.message); }
+    const text = 'RELAY BYTE COMPARE\n' + lines.join('\n');
+    console.log(text);
+    const div = document.createElement('pre');
+    div.textContent = text;
+    div.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;z-index:99999;background:#000c;color:#7dff9b;padding:10px;font:14px Consolas,monospace;white-space:pre-wrap;max-height:50vh;overflow:auto;border:1px solid #7dff9b';
+    document.body.appendChild(div);
   }
   _setOpen() {
     this._state = OPEN;
@@ -112,6 +156,7 @@ export class RelayChannel {
   _setClosed(clean = true) {
     if (this._state === CLOSED) return;
     this._state = CLOSED;
+    if (this._rec) setTimeout(() => this._compareWithServer(), 400);
     if (this.onclose) this.onclose({ type: 'close', wasClean: clean, code: clean ? 1000 : 1006, reason: '' });
   }
 }
