@@ -38,7 +38,7 @@ const CRC_TABLE = (() => {
   return t;
 })();
 function tapNext(off) {
-  return off < 1048576 ? (Math.floor(off / 65536) + 1) * 65536 : (Math.floor(off / 1048576) + 1) * 1048576;
+  return off < 1048576 ? (Math.floor(off / 8192) + 1) * 8192 : (Math.floor(off / 1048576) + 1) * 1048576;
 }
 class StreamTap {
   constructor(label) { this.label = label; this.total = 0; this.c = 0xFFFFFFFF; }

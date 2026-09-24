@@ -209,7 +209,7 @@ const PROBE_ACK = '__relay_probe_ack__';
 // server and the browser (vnc.html?debug=1) use the same offsets, so the first
 // offset where two hops print a different crc is where the stream was damaged.
 const TAP_FINE_LIMIT = 1024 * 1024;
-const TAP_FINE_STEP = 64 * 1024;
+const TAP_FINE_STEP = 8 * 1024;
 const TAP_COARSE_STEP = 1024 * 1024;
 function tapNextCheckpoint(off) {
   return off < TAP_FINE_LIMIT
