@@ -19,7 +19,7 @@ const WS_CONNECT_TIMEOUT_MS = 6000;
 const PROBE_TIMEOUT_MS = 3000;
 const HTTP_WAIT_MS = 20000;
 const HTTP_RECV_TIMEOUT_MS = 35000;
-const HTTP_MAX_FAILURES = 6;
+const HTTP_MAX_FAILURES = 12;
 
 
 // ---- optional stream tap (vnc.html?debug=1) --------------------------------
@@ -168,6 +168,19 @@ function b64ToBytes(b64) {
   return out;
 }
 
+// Same keystream as server.js maskBytes(): the relay XORs each response with a
+// keystream derived from a nonce WE choose per request, so a retry after a
+// filter block never carries the same bytes on the wire.
+function unmaskBytes(u8, nonce) {
+  let x = (nonce >>> 0) || 1;
+  for (let i = 0; i < u8.length; i++) {
+    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    u8[i] ^= x & 0xFF;
+  }
+  return u8;
+}
+function freshNonce() { return ((Math.random() * 0xFFFFFFFF) >>> 0) || 1; }
+
 // ---- WebSocket path -------------------------------------------------------
 
 function tryWebSocket(role, token) {
@@ -231,7 +244,14 @@ async function httpChannel(role, token) {
 
   // Cheap reachability check so we fail here (and can report it) instead of
   // handing back a channel that silently does nothing.
-  const check = await fetch(`${base}/recv?wait=0`, { cache: 'no-store' });
+  // The main VNC stream (role 'viewer') uses acknowledged delivery: every
+  // /recv says "I have all bytes below offset ack", the relay answers with the
+  // bytes starting exactly there and only forgets them once we ack them. A
+  // response that NetFree blocks, truncates or alters is detected (offset /
+  // length / CRC32 checked on every message) and simply requested again.
+  const streamMode = role === 'viewer';
+  let ack = 0;
+  const check = await fetch(`${base}/recv?wait=0${streamMode ? `&ack=0&n=${freshNonce()}` : ''}`, { cache: 'no-store' });
   if (!check.ok) throw new Error(`HTTP relay check failed: ${check.status}`);
   const first = await check.json();
 
@@ -241,6 +261,7 @@ async function httpChannel(role, token) {
   // it's a byte stream. Text (control JSON) is never merged: boundaries matter.
   const outq = [];
   let sending = false;
+  let sendOff = 0;
   async function pumpSend() {
     if (sending) return;
     sending = true;
@@ -261,13 +282,18 @@ async function httpChannel(role, token) {
         let attempt = 0;
         for (;;) {
           try {
-            const r = await fetch(`${base}/send${isText ? '?t=1' : ''}`, {
+            // ?off=<bytes already sent> makes a retry after a lost response
+            // idempotent: the relay skips bytes it already has.
+            const q = isText ? '?t=1' : (streamMode ? `?off=${sendOff}` : '');
+            const r = await fetch(`${base}/send${q}`, {
               method: 'POST',
               headers: { 'Content-Type': isText ? 'text/plain' : 'application/octet-stream' },
               body,
               cache: 'no-store',
             });
+            if (r.status === 409) { fatal('send: relay reports a gap in the browser->agent stream'); return; }
             if (!r.ok) throw new Error(`send ${r.status}`);
+            if (!isText) sendOff += body.length;
             break;
           } catch (e) {
             if (closed) return;
@@ -343,23 +369,48 @@ async function httpChannel(role, token) {
     }
   }
 
+  // Acknowledged-stream handler: accept a message only if it is EXACTLY the
+  // next bytes we expect and its length and CRC match. Anything else is
+  // dropped (never delivered to noVNC) and the same ack is requested again.
+  function handleStream(payload) {
+    const m = (payload.messages || [])[0];
+    if (!m) return;
+    let bytes;
+    try { bytes = b64ToBytes(m.data); } catch (e) { throw new Error('bad base64 (truncated response?)'); }
+    if (m.n) unmaskBytes(bytes, m.n);
+    const problems = [];
+    if (m.off !== ack) problems.push(`offset: relay sent ${m.off}, browser needs ${ack}`);
+    if (m.len !== bytes.length) problems.push(`length: relay sent ${m.len}, browser decoded ${bytes.length}`);
+    else if (m.crc !== undefined && crc32(bytes) !== m.crc) problems.push(`crc mismatch at ${m.off} (${m.len} bytes)`);
+    if (problems.length) {
+      console.warn(`[relay] bad /recv response, asking again from ${ack}: ${problems.join('; ')}`);
+      throw new Error(problems.join('; '));
+    }
+    msgCount++;
+    ack += bytes.length;
+    channel._deliver(bytes.buffer);
+  }
+  function handleAny(payload) { if (streamMode) handleStream(payload); else handle(payload); }
+
   // Incoming: strictly one long-poll in flight, re-issued immediately.
   (async () => {
-    handle(first);
+    try { handleAny(first); } catch (e) { failures++; }
     while (!closed) {
       recvAbort = new AbortController();
       const timer = setTimeout(() => recvAbort.abort(), HTTP_RECV_TIMEOUT_MS);
       try {
-        const r = await fetch(`${base}/recv?wait=${HTTP_WAIT_MS}`, { signal: recvAbort.signal, cache: 'no-store' });
+        const q = streamMode ? `&ack=${ack}&n=${freshNonce()}` : '';
+        const r = await fetch(`${base}/recv?wait=${HTTP_WAIT_MS}${q}`, { signal: recvAbort.signal, cache: 'no-store' });
+        if (r.status === 409) { fatal('relay lost track of the stream (bad ack) - start a new session'); return; }
         if (!r.ok) throw new Error(`recv ${r.status}`);
         const payload = await r.json();
+        handleAny(payload);
         failures = 0;
-        handle(payload);
         if (payload.closed) { closed = true; channel._setClosed(true); return; }
       } catch (e) {
         if (closed) return;
         if (++failures >= HTTP_MAX_FAILURES) { fatal(`recv failed repeatedly: ${e.message}`); return; }
-        await new Promise((res) => setTimeout(res, Math.min(2000, 300 * failures)));
+        await new Promise((res) => setTimeout(res, streamMode ? Math.min(500, 100 * failures) : Math.min(2000, 300 * failures)));
       } finally {
         clearTimeout(timer);
       }

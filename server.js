@@ -103,6 +103,10 @@ app.get('/agent-test.ps1', (_req, res) => {
   res.type('text/plain; charset=utf-8').sendFile(path.join(__dirname, 'public', 'agent-test.ps1'));
 });
 
+app.get('/agent-live.ps1', (_req, res) => {
+  res.type('text/plain; charset=utf-8').sendFile(path.join(__dirname, 'public', 'agent-live.ps1'));
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (_req, res) => res.status(200).send('SIONYX VNC Relay is up'));
 app.get('/health', (_req, res) => res.send('ok'));
@@ -295,7 +299,7 @@ function waitForWake(room, role, ms) {
 function getRoom(token) {
   let room = rooms.get(token);
   if (!room) {
-    room = { token, taps: {}, pending: {}, httpSeen: {}, peerClosed: {}, waiters: {} };
+    room = { token, taps: {}, pending: {}, httpSeen: {}, peerClosed: {}, waiters: {}, stream: {}, recvOff: {} };
     for (const role of ROLES) {
       room[role] = null; room.pending[role] = []; room.peerClosed[role] = false; room.waiters[role] = [];
     }
@@ -312,6 +316,47 @@ function cleanupIfEmpty(token, room) {
 
 function pendingByteLength(queue) {
   return queue.reduce((sum, item) => sum + item.data.length, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Acknowledged byte-stream delivery (HTTP /recv?ack=N)
+// ---------------------------------------------------------------------------
+// NetFree sometimes blocks (418) or truncates a /recv response AFTER we have
+// already answered it. With the old "pop the queue and answer" logic those
+// bytes were simply gone: the VNC stream shifted and noVNC died with
+// "Unsupported encoding". Now, for byte-stream roles, the relay keeps every
+// byte it has queued for a role in room.stream[role] until the client
+// ACKs it. The client says "I have everything below offset N" and gets the
+// bytes starting exactly at N. A lost/blocked/corrupt response is therefore
+// harmless: the next request repeats the same ack and gets the same bytes.
+// stream[role] = { base: absolute offset of buf[0], buf: Buffer of unacked bytes }
+function streamOf(room, role) {
+  return room.stream[role] || (room.stream[role] = { base: 0, buf: Buffer.alloc(0) });
+}
+// Move everything waiting in pending[role] into the retained stream buffer.
+function pullPending(room, role) {
+  const queue = room.pending[role];
+  if (!queue.length) return;
+  const s = streamOf(room, role);
+  const chunks = queue.splice(0, queue.length).map((m) => asBuf(m.data));
+  for (const c of chunks) tapOf(room, ROLE_PAIRS[role], 'out').feed(c);
+  s.buf = Buffer.concat([s.buf, ...chunks]);
+}
+function backlogBytes(room, role) {
+  const s = room.stream[role];
+  return pendingByteLength(room.pending[role]) + (s ? s.buf.length : 0);
+}
+// Deterministic keystream (xorshift32) so a client-chosen nonce changes the
+// bytes on the wire. If the filter blocks a response because of its CONTENT,
+// asking again with a new nonce yields a different body for the same data.
+function maskBytes(buf, nonce) {
+  const out = Buffer.from(buf);
+  let x = (nonce >>> 0) || 1;
+  for (let i = 0; i < out.length; i++) {
+    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    out[i] ^= x & 0xFF;
+  }
+  return out;
 }
 
 // VNC (agent/viewer) is a byte stream: dropping ANY queued chunk silently
@@ -333,9 +378,10 @@ function bufferForPeer(room, peerRole, data, isBinary) {
   const queue = room.pending[peerRole];
   queue.push({ data, isBinary });
   if (isByteStreamRole(peerRole)) {
-    if (pendingByteLength(queue) > STREAM_HARD_CAP_BYTES) {
+    if (backlogBytes(room, peerRole) > STREAM_HARD_CAP_BYTES) {
       console.error(`[relay] ${ts()} OVERFLOW room ${roomLabel(room.token)}: ${peerRole} is not draining (>${STREAM_HARD_CAP_BYTES} bytes queued). Closing the session instead of dropping bytes.`);
       queue.length = 0;
+      delete room.stream[peerRole];
       room.peerClosed[peerRole] = true;
       const ws = room[peerRole];
       if (ws) { try { ws.close(1011, 'relay overflow'); } catch { /* ignore */ } }
@@ -602,10 +648,29 @@ app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' 
   const room = getRoom(token);
   const label = roomLabel(token);
   const isText = req.query.t === '1';
-  const body = req.body && req.body.length ? req.body : Buffer.alloc(0);
+  let body = req.body && req.body.length ? req.body : Buffer.alloc(0);
 
   room.httpSeen[role] = Date.now();
   room.peerClosed[ROLE_PAIRS[role]] = false;
+
+  // Idempotent sends: a client that passes ?off=<bytes it has sent so far> can
+  // safely retry a POST whose response was lost/blocked. A chunk we already
+  // have is skipped instead of being delivered twice.
+  if (isByteStreamRole(role) && !isText && req.query.off !== undefined) {
+    const off = Number(req.query.off);
+    const expected = room.recvOff[role] || 0;
+    if (!Number.isFinite(off) || off > expected) {
+      console.error(`[relay] ${ts()} http-send ${role} room ${label} GAP: client off=${req.query.off}, expected ${expected}`);
+      return res.status(409).json({ error: 'gap', expected });
+    }
+    if (off < expected) {
+      const skip = expected - off;
+      console.log(`[relay] ${ts()} http-send ${role} room ${label} duplicate ${Math.min(skip, body.length)} byte(s) skipped`);
+      if (skip >= body.length) return res.json({ ok: true, dup: true, next: expected });
+      body = body.subarray(skip);
+    }
+    room.recvOff[role] = expected + body.length;
+  }
   console.log(`[relay] ${ts()} http-send ${role} room ${label} bytes=${body.length} text=${isText}`);
 
   const outcome = routeMessage(room, role, body, !isText);
@@ -615,12 +680,12 @@ app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' 
   // sender (and, on the kiosk, its reads from TightVNC) instead of letting the
   // queue grow without bound. Nothing is dropped; it just waits for the peer.
   const peerRole = ROLE_PAIRS[role];
-  if (outcome === 'buffered' && isByteStreamRole(role) && pendingByteLength(room.pending[peerRole]) > STREAM_HIGH_WATER_BYTES) {
+  if (outcome === 'buffered' && isByteStreamRole(role) && backlogBytes(room, peerRole) > STREAM_HIGH_WATER_BYTES) {
     const t0 = Date.now();
-    while (rooms.has(token) && pendingByteLength(room.pending[peerRole]) > STREAM_LOW_WATER_BYTES && Date.now() - t0 < 20000) {
+    while (rooms.has(token) && backlogBytes(room, peerRole) > STREAM_LOW_WATER_BYTES && Date.now() - t0 < 20000) {
       await waitForWake(room, `${role}:drained`, 250);
     }
-    console.log(`[relay] ${ts()} http-send ${role} room ${label} held ${Date.now() - t0}ms for backpressure (peer backlog=${pendingByteLength(room.pending[peerRole])})`);
+    console.log(`[relay] ${ts()} http-send ${role} room ${label} held ${Date.now() - t0}ms for backpressure (peer backlog=${backlogBytes(room, peerRole)})`);
   }
   res.json({ ok: true, outcome });
 });
@@ -641,6 +706,52 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
 
   const requestedWait = parseInt(req.query.wait, 10);
   const waitMs = Number.isFinite(requestedWait) ? Math.min(Math.max(requestedWait, 0), 25000) : 20000;
+
+  // ---- acknowledged byte-stream mode (?ack=N) -----------------------------
+  // See the comment above pullPending(). Idempotent: the same ack always gets
+  // the same bytes, so a response lost to NetFree costs one retry, not the session.
+  if (isByteStreamRole(role) && req.query.ack !== undefined) {
+    const ack = Number(req.query.ack);
+    const nonce = Number(req.query.n) >>> 0;
+    if (!Number.isFinite(ack) || ack < 0) return res.status(400).json({ error: 'bad ack' });
+    let gone = false;
+    res.on('close', () => { if (!res.writableEnded) { gone = true; wakeWaiters(room, role); } });
+    const s = streamOf(room, role);
+    const until = Date.now() + waitMs;
+    let closedFlag = false;
+    for (;;) {
+      pullPending(room, role);
+      if (ack < s.base || ack > s.base + s.buf.length) {
+        console.error(`[relay] ${ts()} http-recv ${role} room ${label} BAD ACK ${ack} (retained ${s.base}..${s.base + s.buf.length})`);
+        return res.status(409).json({ error: 'bad ack', base: s.base, end: s.base + s.buf.length });
+      }
+      if (ack > s.base) { // client confirmed these bytes - forget them
+        s.buf = s.buf.subarray(ack - s.base);
+        s.base = ack;
+        wakeWaiters(room, `${ROLE_PAIRS[role]}:drained`);
+      }
+      if (s.buf.length) break;
+      if (room.peerClosed[role]) { closedFlag = true; break; }
+      const remaining = until - Date.now();
+      if (remaining <= 0 || gone) break;
+      await waitForWake(room, role, remaining);
+      if (!rooms.has(token)) break;
+    }
+    if (gone) return;
+    room.httpSeen[role] = Date.now();
+    const part = s.buf.subarray(0, RECV_MAX_BYTES);
+    if (part.length) {
+      console.log(`[relay] ${ts()} http-recv ${role} room ${label} off=${s.base} bytes=${part.length} backlog=${s.buf.length}`);
+      return res.json({
+        messages: [{
+          data: (nonce ? maskBytes(part, nonce) : part).toString('base64'),
+          len: part.length, binary: true, off: s.base, crc: zlibCrc32 ? zlibCrc32(part) >>> 0 : undefined,
+          ...(nonce ? { n: nonce } : {}),
+        }],
+      });
+    }
+    return res.json({ messages: [], ...(closedFlag ? { closed: true } : {}) });
+  }
 
   // If the client hangs up mid-poll (its own timeout, a network blip), we
   // must not hand the messages we were about to deliver to nobody - for a VNC
@@ -752,6 +863,8 @@ app.post('/rt/:role/:token/reset', (req, res) => {
   const room = getRoom(token);
   for (const r of [role, ROLE_PAIRS[role]]) {
     room.pending[r].length = 0;
+    delete room.stream[r];
+    delete room.recvOff[r];
     room.peerClosed[r] = false;
     wakeWaiters(room, r);
   }
