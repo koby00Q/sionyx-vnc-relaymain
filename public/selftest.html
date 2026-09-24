@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>relay selftest</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{font-family:system-ui,Segoe UI,Arial;margin:24px;background:#111;color:#eee}
+ h1{font-size:20px} button{font-size:18px;padding:10px 22px;cursor:pointer}
+ .row{font-family:Consolas,monospace;font-size:16px;margin:6px 0;padding:8px 12px;border-radius:6px;white-space:pre-wrap}
+ .ok{background:#0a3d1a;color:#7dff9b}.bad{background:#4a1010;color:#ff9b9b}.info{background:#222;color:#bbb}
+</style></head><body>
+<h1>Relay selftest (runs in THIS browser)</h1>
+<div class="row info" id="ua"></div>
+<button id="go">Run test</button>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out');
+document.getElementById('ua').textContent = navigator.userAgent;
+function row(text, cls){ const d=document.createElement('div'); d.className='row '+cls; d.textContent=text; out.appendChild(d); }
+function makeBytes(n){ const b=new Uint8Array(n); let s=12345; for(let i=0;i<n;i++){ s=(s*1103515245+12345)&0x7fffffff; b[i]=(s>>16)&0xff; } for(let i=0;i<Math.min(256,n);i++) b[i]=i; return b; }
+function b64ToBytes(b64){ const bin=atob(b64); const o=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) o[i]=bin.charCodeAt(i); return o; }
+async function test(n){
+  const tok='bt-'+Math.random().toString(36).slice(2,9);
+  const base='/rt';
+  const sent=makeBytes(n);
+  const r0=await fetch(`${base}/agent/${tok}/send`,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:sent});
+  if(!r0.ok) return row(`${n} bytes: send failed HTTP ${r0.status}`,'bad');
+  const got=[]; let total=0, responses=0, note='';
+  while(total<n && responses<12){
+    const r=await fetch(`${base}/viewer/${tok}/recv?wait=2000`,{cache:'no-store'});
+    responses++;
+    const txt=await r.text();
+    if(responses===1) note=`content-type=${r.headers.get('content-type')} encoding=${r.headers.get('content-encoding')||'-'}`;
+    let p; try{ p=JSON.parse(txt);}catch(e){ return row(`${n} bytes: response is not valid JSON (len ${txt.length}) start=${txt.slice(0,80)}`,'bad'); }
+    for(const m of p.messages||[]){
+      let b; try{ b=b64ToBytes(m.data);}catch(e){ return row(`${n} bytes: base64 decode failed (len ${m.data.length})`,'bad'); }
+      if(m.len!==undefined && m.len!==b.length) row(`  message says len=${m.len} but decoded ${b.length}`,'bad');
+      got.push(b); total+=b.length;
+    }
+  }
+  const all=new Uint8Array(total); let o=0; for(const g of got){ all.set(g,o); o+=g.length; }
+  let diff=-1; const m=Math.min(n,total); for(let i=0;i<m;i++){ if(all[i]!==sent[i]){ diff=i; break; } }
+  fetch(`${base}/agent/${tok}/close`,{method:'POST'}).catch(()=>{}); fetch(`${base}/viewer/${tok}/close`,{method:'POST'}).catch(()=>{});
+  if(total===n && diff===-1) row(`${n} bytes: OK  (responses=${responses})  ${note}`,'ok');
+  else row(`${n} bytes: BAD  got=${total}  firstDiff=${diff}` + (diff>=0?`  sent=0x${sent[diff].toString(16)} got=0x${all[diff].toString(16)}`:'') + `  responses=${responses}  ${note}`,'bad');
+}
+document.getElementById('go').onclick=async()=>{
+  out.innerHTML=''; row('running...','info');
+  try{ for(const n of [1000,8000,16000,16384,24000,62804]) await test(n); row('done','info'); }
+  catch(e){ row('ERROR '+e.message,'bad'); }
+};
+</script></body></html>
